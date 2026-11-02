@@ -19,6 +19,12 @@ pair instead as `ALP_API_KEY_ID` and `ALP_API_SECRET_KEY`. With both set the
 keychain is never opened; with only one set, or either empty, the command
 fails (exit 3) rather than fall back to a different pair.
 
+The Worker module (`alp-mcp-<version>.wasm`, for a Cloudflare Worker the
+user deploys into their own account) reads the same two names from that
+Worker's secrets, and holds them to the same both-or-neither rule. It sends
+the keys only to `https://` hosts (or plain HTTP to a loopback address, for
+a local mock in development); no service of the authors' ever sees them.
+
 An Alpaca API key pair is a **full-power credential**: the same pair that
 reads a position can place a live order or liquidate one. Treat it like a
 password, and prefer creating it with trading disabled on the Alpaca
@@ -38,7 +44,9 @@ dashboard if the account offers that.
 - `alp mcp` serves two read-only tools over the same client. A tool call
   never signs in, prompts or creates a keychain item: a missing or rejected
   pair is an `auth` error asking the user to run `alp auth login` in a
-  terminal.
+  terminal. The Worker module serves the same two tools over the same
+  client; there a missing or rejected pair is an `auth` error asking the
+  user to update the Worker's secrets.
 - It hardcodes no secrets. `gitleaks` runs in CI over the full history, and
   an offline test walks `git ls-files` for personal-data shapes.
 

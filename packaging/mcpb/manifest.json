@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "alp",
   "display_name": "Alpaca (alp)",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Read-only access to your own Alpaca brokerage balances, positions and activity, through the open-source alp CLI.",
   "long_description": "Ask Claude about your Alpaca brokerage account: what you hold and what it is worth, and what happened over a period (trade fills, dividends, interest, fees). Two read-only tools, alpaca_portfolio and alpaca_activities; nothing can trade, transfer or change your account. Your Alpaca API key pair stays on your computer: Claude Desktop keeps it in its own secure store and passes it to the bundled alp binary, which calls Alpaca's Trading API directly. Unofficial; not affiliated with Alpaca.",
   "author": {

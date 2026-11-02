@@ -8,13 +8,13 @@
 //! (SPEC v1 §1.2).
 
 use pk_cli_auth::{AuthMethod, AuthStatus, LoginArgs, SetCredentialArgs};
-use pk_cli_core::{CliError, CommonArgs};
+use pk_cli_core::{block_on, CliError, CommonArgs};
 use pk_cli_secrets::{CredentialStore, Secret};
 
 use crate::client::Alpaca;
-use crate::commands::{account, str_at};
 use crate::config::Env;
 use crate::credential::{self, ApiKeys};
+use crate::reads::{self, str_at};
 
 pub fn login(
     common: &CommonArgs,
@@ -51,7 +51,7 @@ pub fn login(
     // so a paper key can't be silently filed as a live credential.
     if !args.no_verify {
         let api = Alpaca::new(base_url.to_string(), keys.clone(), common.verbose)?;
-        let account = api.get(account::PATH, &[])?;
+        let account = block_on(reads::account(&api))?;
         if !common.quiet {
             eprintln!(
                 "verified against {} — account {} ({})",
@@ -138,7 +138,7 @@ pub fn status(
         match stored {
             Some(keys) => {
                 let api = Alpaca::new(base_url.to_string(), keys, common.verbose)?;
-                match api.get(account::PATH, &[]) {
+                match block_on(reads::account(&api)) {
                     Ok(account) => {
                         st.session_valid = Some(true);
                         st.account = str_at(&account, "account_number");

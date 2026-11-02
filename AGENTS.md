@@ -18,7 +18,7 @@ docs.alpaca.markets). It exists to feed tax work:
 
 Conforms to `piekstra-cli/1` (see `~/Dev/cli-common/DESIGN.md` and
 `conformance.md`). Shared behavior comes from the `pk-cli-*` crates pinned to
-tag **v0.12.0** — reuse before writing (dates, output, `RangeArgs`, `Paged`,
+tag **v0.14.0** — reuse before writing (dates, output, `RangeArgs`, `Paged`,
 keychain, config, self-update).
 
 ## The verbatim DTO contract (do not "improve" it)
@@ -34,15 +34,50 @@ enforces this — keep it passing.
 `account/v1` and `position-list/v1` are curated family shapes, but their
 money amounts are still the wire's strings, untouched.
 
-## MCP tools (`alp mcp`)
+## Layout and features
+
+- `src/client.rs` — `Alpaca<T>`, the GET-only client over pk-cli-core's
+  `Transport`: blocking reqwest natively (`Alpaca::new`, paced at 4 req/s),
+  the Worker's `fetch` in the module (`Alpaca::with_transport`).
+- `src/reads.rs` — the provider reads (account, positions, the activities
+  walk) and their mapping and filtering, clap-free and async; the commands
+  drive them with `pk_cli_core::block_on`.
+- `src/commands/*` — the clap-facing half of each command (feature
+  `native`).
+- `src/mcp.rs` — the MCP tools; `src/worker.rs` — the same tools as a
+  WebAssembly module (feature `wasm`).
+
+Features: `native` (default) is everything the binary needs (keychain,
+clap, self-update, blocking HTTP, the stdio MCP server); `wasm` is the
+Worker module. The library builds for `wasm32-unknown-unknown` with
+`--no-default-features --features wasm`, so nothing that needs the OS (the
+keychain, `SystemTime`, `std::thread`, blocking I/O) may reach `reads`,
+`client`'s shared path or `mcp`'s toolset: the toolset takes today's date
+from a `Today` function, the Worker's clock in the module.
+
+## MCP tools (`alp mcp`, and the Worker module)
 
 `src/mcp.rs` serves `alpaca_portfolio` and `alpaca_activities` over stdio
 (cli-common's `pk-cli-mcp`, DESIGN.md §1.9), reading through the same
-client and mapping code the commands use, behind a `Source` seam.
+client and mapping code the commands use, behind a `Source` seam:
+`LiveSource` for `alp mcp`, `ClientSource` for the Worker module.
+
+`src/worker.rs` exports the same toolset as a WebAssembly module for
+cli-common's deploy-your-own Cloudflare connector (`pk_cli_mcp::export_wasm!`).
+`make wasm` builds it and checks it against the host's contract
+(`scripts/check-wasm.mjs`); the release attaches it as
+`alp-mcp-<version>.wasm` with its `.sha256`, which the connector pins. Its
+settings are the Worker's secrets and vars by the CLI's own names
+(`ALP_API_KEY_ID`, `ALP_API_SECRET_KEY`, optional `ALP_ENV` and
+`ALP_BASE_URL`; docs/api.md §6), and its instructions and auth errors say
+the keys are Worker secrets.
 
 - `tests/mcp_tools.rs` runs every tool in process over the fixtures, plus
   cli-common's conformance check (names, annotations, descriptions, flat
   inputs, output schemas, definitions under 8,000 characters).
+- `tests/worker.rs` (feature `wasm`) drives the module's toolset natively
+  through pk-cli-mcp's stand-in host: every request's headers and host, the
+  activities walk, and the auth errors that name the Worker's secrets.
 - `tests/mcp_stdio.rs` drives the real binary over stdio; `tests/packaging.rs`
   holds `packaging/mcpb/manifest.json` (the Claude Desktop extension the
   release workflow packs) to the code: version, tools, env vars.
@@ -59,7 +94,8 @@ client and mapping code the commands use, behind a `Source` seam.
 ## Build / test / lint
 
 ```console
-$ make verify     # fmt-check + clippy -D warnings + tests + smoke — the gate
+$ make verify     # fmt-check + clippy (native and wasm features) + tests + wasm32 clippy + smoke — the gate
+$ make wasm       # the Worker module, checked (needs the wasm32-unknown-unknown target and Node)
 $ make install    # cargo install + dev-sign (see below)
 ```
 
@@ -69,8 +105,9 @@ $ make install    # cargo install + dev-sign (see below)
 - macOS signing: every Makefile target that produces a binary re-signs it via
   `~/Dev/cli-common/scripts/dev-sign.sh`. Skipping this makes keychain
   "Always Allow" grants silently expire on each rebuild.
-- CI mirrors `make verify` on Linux (cost discipline; the keychain runtime
-  path is covered by local dogfooding of the signed binary).
+- CI mirrors `make verify` on Linux and builds the module with `make wasm`
+  (cost discipline; the keychain runtime path is covered by local
+  dogfooding of the signed binary).
 
 ## Provider model (the short version — details in docs/api.md)
 

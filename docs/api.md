@@ -32,8 +32,9 @@ at `auth login` time against the environment the keys will be stored under.
 Errors are `{"code": <int>, "message": "<text>"}`; the client surfaces
 `message` because the HTTP status alone doesn't distinguish revoked keys
 from an account restriction. Rate limit: ~200 requests/minute on the
-standard plan; the client paces at 4 req/s and maps 429 to exit 5 without
-retrying.
+standard plan; the binary paces at 4 req/s and maps 429 to exit 5 without
+retrying. The Worker module ([section 6](#6-the-worker-module)) sends the same
+requests unpaced, and reads at most 40 activity pages a call.
 
 ## 2. `GET /v2/account` — OFFICIAL-DOCS (reference/getaccount-1)
 
@@ -74,7 +75,7 @@ FOPT, OCT. The CLI does **not** validate `--type` against this list — prior
 family work (schw) found live enums the published schema lacked, and a
 client that rejects the unknown breaks on the provider's next release.
 `alp dividends list` filters to the DIV\*/INT\* families
-(`DIVIDEND_INTEREST_TYPES` in `src/commands/activities.rs`).
+(`DIVIDEND_INTEREST_TYPES` in `src/reads.rs`).
 
 **Query parameters**: `activity_types` (comma list; mutually exclusive with
 `category`), `date`, `after`, `until`, `direction` (`asc`/`desc`, default
@@ -115,7 +116,7 @@ needs on the same origin, auth, and pacing.
 ## 4. Rate limits
 
 OFFICIAL-DOCS: 200 requests/minute per key pair on the standard plan
-(bursts above that answer 429 with a `retry-after`-less body). The client's
+(bursts above that answer 429 with a `retry-after`-less body). The binary's
 250 ms floor keeps even a multi-year activities walk far under it.
 
 ## 5. Out of scope
@@ -124,3 +125,36 @@ The market-data API lives on a **different host** (`data.alpaca.markets`).
 `alp api` deliberately refuses it (origin check): quotes/bars are not
 account data, and keeping one origin makes "where do the key headers go"
 auditable. Wrap it in a separate command group if it's ever needed.
+
+## 6. The Worker module
+
+`alp-mcp-<version>.wasm` (feature `wasm`, `src/worker.rs`; built by
+`make wasm` and attached to each release) runs the two MCP tools in
+cli-common's deploy-your-own Cloudflare Worker (`connector/`). It sends the
+requests above, built by the same client: `GET` only, the two key headers,
+`Accept: application/json` and `User-Agent: alp/<version>`, through the
+Worker's `fetch`, which follows no redirect (a 3xx is exit 5's upstream
+error). The tools read:
+
+| Tool | Requests |
+|---|---|
+| `alpaca_portfolio` | `GET /v2/account`, then `GET /v2/positions` |
+| `alpaca_activities` | `GET /v2/account/activities?direction=desc&page_size=100[&activity_types=<comma list>][&page_token=<last id>]`, page after page until a page has fewer than 100 rows or its oldest dated row is two calendar months before `since` |
+
+One call reads at most 40 activity pages (`MAX_ACTIVITY_PAGES`, 4,000
+rows): Cloudflare's free plan allows 50 outbound requests per invocation,
+and past that every `fetch` fails. The walk is otherwise the binary's: it
+starts at the newest row and sends no server-side date bound (§3's trap),
+so every row since `since` counts against the 40 pages, including those
+after `until`. A walk that needs more is a `usage` error saying so, which
+suggests a later `since`, a `types` filter or `alp transactions list`; it
+never answers with part of the history. An old window on a very active
+account can therefore be out of the module's reach. The binary's walk has
+no bound.
+
+Its settings are the Worker's secrets and vars, by the CLI's own names:
+`ALP_API_KEY_ID` and `ALP_API_SECRET_KEY` (both, or the call is an auth
+error naming what is missing), `ALP_ENV` (`live` by default, or `paper`) and
+`ALP_BASE_URL` (an override; `https://`, or plain `http://` only to a
+loopback address, for a local mock). Today's date, for the default window,
+is the Worker's clock in UTC.

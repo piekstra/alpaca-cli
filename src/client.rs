@@ -9,38 +9,60 @@
 //! between this binary and someone's money is the absence of a method on this
 //! struct, so adding a write means adding one here — a visible change, in the
 //! same commit as the docs.
+//!
+//! Written once against pk-cli-core's [`Transport`], so the terminal binary
+//! (`pk_cli_http::BlockingTransport`) and the Cloudflare Worker module
+//! (`pk_cli_mcp::wasm::HostTransport`, the Worker's `fetch`) run this same
+//! request building and error mapping. Natively the futures finish on their
+//! first poll; the commands drive them with `pk_cli_core::block_on`.
 
-use std::cell::RefCell;
-use std::time::{Duration, Instant};
-
+use pk_cli_core::transport::{HttpRequest, HttpResponse, Transport};
 use pk_cli_core::CliError;
 use serde_json::Value;
 
+use crate::config::BIN;
 use crate::credential::ApiKeys;
 
-/// Minimum spacing between requests. Alpaca's documented budget is 200
-/// requests/minute per key on the standard plan (docs/api.md §4); 250 ms is
-/// a polite 4/s burst floor that no CLI invocation here ever sustains long
-/// enough to matter.
-const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(250);
-
-pub struct Alpaca {
-    http: reqwest::blocking::Client,
+/// The Alpaca Trading API client over any transport: blocking reqwest, paced,
+/// natively ([`NativeAlpaca`]); the Worker's `fetch` in the module.
+pub struct Alpaca<T> {
+    transport: T,
     base_url: String,
     keys: ApiKeys,
-    last_request: RefCell<Option<Instant>>,
     verbose: bool,
+    rejected_key_hint: Option<&'static str>,
 }
 
-impl Alpaca {
+/// The binary's client.
+#[cfg(feature = "native")]
+pub type NativeAlpaca = Alpaca<Paced<pk_cli_http::BlockingTransport>>;
+
+#[cfg(feature = "native")]
+impl NativeAlpaca {
+    /// The binary's client: blocking HTTP, paced, and auth errors that name
+    /// the commands that fix them.
     pub fn new(base_url: String, keys: ApiKeys, verbose: bool) -> Result<Self, CliError> {
-        Ok(Self {
-            http: pk_cli_http::client(crate::config::BIN, env!("CARGO_PKG_VERSION"))?,
-            base_url,
+        let transport = Paced::new(pk_cli_http::BlockingTransport::new()?);
+        let mut client = Self::with_transport(&base_url, keys, transport);
+        client.verbose = verbose;
+        client.rejected_key_hint =
+            Some("check the environment (`alp config show`) and re-run `alp auth login`");
+        Ok(client)
+    }
+}
+
+impl<T: Transport> Alpaca<T> {
+    /// A client over any transport. Error messages name no `alp` command:
+    /// the Worker builds its client this way, where the keys live in the
+    /// Worker's secrets, not a keychain.
+    pub fn with_transport(base_url: &str, keys: ApiKeys, transport: T) -> Self {
+        Self {
+            transport,
+            base_url: base_url.trim_end_matches('/').to_string(),
             keys,
-            last_request: RefCell::new(None),
-            verbose,
-        })
+            verbose: false,
+            rejected_key_hint: None,
+        }
     }
 
     pub fn base_url(&self) -> &str {
@@ -54,35 +76,111 @@ impl Alpaca {
         same_origin(&self.base_url, url)
     }
 
-    /// GET a path (leading slash, relative to the API host) with optional
-    /// query parameters.
-    pub fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value, CliError> {
-        self.pace();
-        if self.verbose {
-            // The path and parameters, never the keys.
-            eprintln!("GET {}{path} {query:?}", self.base_url);
-        }
-        let resp = self
-            .http
-            .get(format!("{}{path}", self.base_url))
+    /// The GET for a path (leading slash, relative to the API host) with
+    /// optional query parameters.
+    fn request(&self, path: &str, query: &[(&str, String)]) -> HttpRequest {
+        HttpRequest::get(format!("{}{path}", self.base_url))
             .query(query)
             .header("APCA-API-KEY-ID", &self.keys.key_id)
             .header("APCA-API-SECRET-KEY", &self.keys.secret_key)
             .header("Accept", "application/json")
-            .send()?;
-        response_json(resp)
+            // On the request, so the binary and the Worker send the same one.
+            .user_agent(BIN, env!("CARGO_PKG_VERSION"))
     }
 
-    /// Sleep just long enough to keep under [`MIN_REQUEST_INTERVAL`].
-    fn pace(&self) {
-        let mut last = self.last_request.borrow_mut();
-        if let Some(prev) = *last {
-            let elapsed = prev.elapsed();
-            if elapsed < MIN_REQUEST_INTERVAL {
-                std::thread::sleep(MIN_REQUEST_INTERVAL - elapsed);
+    /// GET a path with optional query parameters.
+    pub async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value, CliError> {
+        if self.verbose {
+            // The path and parameters, never the keys.
+            eprintln!("GET {}{path} {query:?}", self.base_url);
+        }
+        let resp = self.transport.send(self.request(path, query)).await?;
+        response_json(&resp, self.rejected_key_hint)
+    }
+}
+
+#[cfg(feature = "native")]
+pub use pace::Paced;
+
+/// The binary's request spacing, as a transport around the real one, so the
+/// shared client never sleeps or reads a clock itself. The Worker sends its
+/// requests unpaced: it cannot sleep, and the module bounds how many one tool
+/// call may send (`worker::MAX_ACTIVITY_PAGES`), well inside Alpaca's
+/// 200 a minute.
+#[cfg(feature = "native")]
+mod pace {
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+
+    use pk_cli_core::transport::{HttpRequest, HttpResponse, Transport};
+    use pk_cli_core::CliError;
+
+    /// Minimum spacing between the binary's requests. Alpaca's documented
+    /// budget is 200 requests/minute per key on the standard plan
+    /// (docs/api.md §4); 250 ms is a polite 4/s burst floor that no CLI
+    /// invocation here ever sustains long enough to matter.
+    const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(250);
+
+    /// `T`, sending at most one request per [`MIN_REQUEST_INTERVAL`].
+    pub struct Paced<T> {
+        inner: T,
+        last: RefCell<Option<Instant>>,
+    }
+
+    impl<T> Paced<T> {
+        pub fn new(inner: T) -> Self {
+            Self {
+                inner,
+                last: RefCell::new(None),
             }
         }
-        *last = Some(Instant::now());
+
+        /// Sleep just long enough to keep under [`MIN_REQUEST_INTERVAL`].
+        fn wait(&self) {
+            let mut last = self.last.borrow_mut();
+            if let Some(prev) = *last {
+                let elapsed = prev.elapsed();
+                if elapsed < MIN_REQUEST_INTERVAL {
+                    std::thread::sleep(MIN_REQUEST_INTERVAL - elapsed);
+                }
+            }
+            *last = Some(Instant::now());
+        }
+    }
+
+    impl<T: Transport> Transport for Paced<T> {
+        async fn send(&self, request: HttpRequest) -> Result<HttpResponse, CliError> {
+            self.wait();
+            self.inner.send(request).await
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use pk_cli_core::block_on;
+
+        struct Answer;
+
+        impl Transport for Answer {
+            async fn send(&self, _: HttpRequest) -> Result<HttpResponse, CliError> {
+                Ok(HttpResponse::new(200, "[]"))
+            }
+        }
+
+        #[test]
+        fn requests_are_spaced_by_the_interval() {
+            let paced = Paced::new(Answer);
+            let start = Instant::now();
+            for _ in 0..3 {
+                block_on(paced.send(HttpRequest::get("https://x.test/"))).unwrap();
+            }
+            assert!(
+                start.elapsed() >= MIN_REQUEST_INTERVAL * 2,
+                "{:?}",
+                start.elapsed()
+            );
+        }
     }
 }
 
@@ -97,24 +195,25 @@ pub fn same_origin(base: &str, url: &str) -> bool {
 }
 
 /// Map a response onto the exit-code contract: 401/403 → auth (3), 404 → not
-/// found (4), 429 and other non-2xx → upstream (5); then parse JSON.
+/// found (4), 429 and other non-2xx (a redirect included: none is followed)
+/// → upstream (5); then parse JSON.
 ///
 /// Alpaca's error bodies are `{"code": 40110000, "message": "..."}`; the
 /// message is surfaced because "HTTP 403" alone does not distinguish revoked
-/// keys from an account restriction.
-fn response_json(resp: reqwest::blocking::Response) -> Result<Value, CliError> {
-    let status = resp.status().as_u16();
-    if (200..300).contains(&status) {
-        return resp
-            .json::<Value>()
+/// keys from an account restriction. `hint` is the binary's remedy for
+/// rejected keys; the Worker's comes from the MCP host instead.
+fn response_json(resp: &HttpResponse, hint: Option<&str>) -> Result<Value, CliError> {
+    let status = resp.status;
+    if resp.is_success() {
+        return serde_json::from_str(&resp.body)
             .map_err(|e| CliError::Upstream(format!("parsing provider JSON: {e}")));
     }
-    let detail = body_message(resp);
+    let detail = body_message(&resp.body);
     match status {
-        401 | 403 => Err(CliError::Auth(format!(
-            "Alpaca rejected the API keys (HTTP {status}{detail}) — check the environment \
-             (`alp config show`) and re-run `alp auth login`"
-        ))),
+        401 | 403 => Err(CliError::Auth(match hint {
+            Some(h) => format!("Alpaca rejected the API keys (HTTP {status}{detail}) — {h}"),
+            None => format!("Alpaca rejected the API keys (HTTP {status}{detail})"),
+        })),
         404 => Err(CliError::NotFound(format!("HTTP 404 from Alpaca{detail}"))),
         429 => Err(CliError::Upstream(format!(
             "rate limited by Alpaca (HTTP 429{detail}) — wait a minute and retry"
@@ -128,8 +227,8 @@ fn response_json(resp: reqwest::blocking::Response) -> Result<Value, CliError> {
 /// `: message` from an Alpaca error body, or empty. Never the whole body:
 /// an unexpected payload could be arbitrarily large or carry echoes of the
 /// request.
-fn body_message(resp: reqwest::blocking::Response) -> String {
-    resp.json::<Value>()
+fn body_message(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_owned))
         .map(|m| format!(": {m}"))
@@ -140,16 +239,23 @@ fn body_message(resp: reqwest::blocking::Response) -> String {
 mod tests {
     use super::*;
 
-    fn client() -> Alpaca {
-        Alpaca::new(
-            "https://api.alpaca.markets".into(),
+    struct Unsent;
+
+    impl Transport for Unsent {
+        async fn send(&self, _: HttpRequest) -> Result<HttpResponse, CliError> {
+            unreachable!("these tests build requests without sending them")
+        }
+    }
+
+    fn client() -> Alpaca<Unsent> {
+        Alpaca::with_transport(
+            "https://api.alpaca.markets/",
             ApiKeys {
                 key_id: "AKDUMMY000000000001".into(),
                 secret_key: "DUMMYSECRET0001".into(),
             },
-            false,
+            Unsent,
         )
-        .unwrap()
     }
 
     /// The origin check guards the `api` passthrough: keys must never be sent
@@ -163,5 +269,67 @@ mod tests {
         assert!(!c.same_origin("https://api.alpaca.markets.evil.example/v2/account"));
         assert!(!c.same_origin("https://data.alpaca.markets/v2/stocks"));
         assert!(!c.same_origin("http://api.alpaca.markets/v2/account"));
+    }
+
+    #[test]
+    fn a_request_carries_the_key_headers_and_the_family_user_agent() {
+        let r = client().request("/v2/account/activities", &[("page_size", "100".into())]);
+        assert_eq!(r.method, "GET");
+        assert_eq!(
+            r.url,
+            "https://api.alpaca.markets/v2/account/activities?page_size=100"
+        );
+        assert_eq!(
+            r.header_value("APCA-API-KEY-ID"),
+            Some("AKDUMMY000000000001")
+        );
+        assert_eq!(
+            r.header_value("APCA-API-SECRET-KEY"),
+            Some("DUMMYSECRET0001")
+        );
+        assert_eq!(r.header_value("Accept"), Some("application/json"));
+        assert_eq!(
+            r.header_value("User-Agent"),
+            Some(concat!("alp/", env!("CARGO_PKG_VERSION")))
+        );
+        // Debug shows header names only, never the secret.
+        assert!(!format!("{r:?}").contains("DUMMYSECRET0001"));
+    }
+
+    #[test]
+    fn statuses_map_onto_the_exit_code_contract() {
+        let body = r#"{"code": 40110000, "message": "request is not authorized"}"#;
+        let e = response_json(&HttpResponse::new(401, body), None).unwrap_err();
+        assert_eq!(e.exit_code(), 3);
+        assert!(e.to_string().contains("request is not authorized"), "{e}");
+        assert!(
+            !e.to_string().contains("alp "),
+            "no command without a hint: {e}"
+        );
+        let e = response_json(
+            &HttpResponse::new(403, "{}"),
+            Some("re-run `alp auth login`"),
+        )
+        .unwrap_err();
+        assert!(e.to_string().ends_with("re-run `alp auth login`"), "{e}");
+        assert_eq!(
+            response_json(&HttpResponse::new(404, ""), None)
+                .unwrap_err()
+                .exit_code(),
+            4
+        );
+        for status in [429, 500, 302] {
+            assert_eq!(
+                response_json(&HttpResponse::new(status, "<html>"), None)
+                    .unwrap_err()
+                    .exit_code(),
+                5,
+                "{status}"
+            );
+        }
+        let v = response_json(&HttpResponse::new(200, r#"{"cash":"1.00"}"#), None).unwrap();
+        assert_eq!(v["cash"], "1.00");
+        let e = response_json(&HttpResponse::new(200, "not json"), None).unwrap_err();
+        assert_eq!(e.exit_code(), 5);
     }
 }

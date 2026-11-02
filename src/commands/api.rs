@@ -8,7 +8,7 @@
 //! `data.alpaca.markets` is a different host and deliberately out of scope —
 //! docs/api.md §5.)
 
-use pk_cli_core::{output, CliError};
+use pk_cli_core::{block_on, output, CliError};
 use pk_cli_http::ApiArgs;
 
 use crate::commands::Ctx;
@@ -23,7 +23,7 @@ pub fn run(ctx: &Ctx, args: &ApiArgs) -> Result<(), CliError> {
         )));
     }
     let path = &url[ctx.api.base_url().len()..];
-    let v = ctx.api.get(path, &[])?;
+    let v = block_on(ctx.api.get(path, &[]))?;
     // A passthrough's output *is* the provider's JSON, in both modes.
     output::json(&v);
     Ok(())

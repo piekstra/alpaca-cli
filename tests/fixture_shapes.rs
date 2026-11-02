@@ -7,10 +7,9 @@
 
 use std::path::PathBuf;
 
-use alp::commands::activities::{
-    activity_date, keep_sorted, resolve_range, DIVIDEND_INTEREST_TYPES,
-};
-use alp::commands::{account::account_dto, positions::Position};
+use alp::commands::account::account_dto;
+use alp::commands::activities::resolve_range;
+use alp::reads::{activity_date, keep_sorted, Position, DIVIDEND_INTEREST_TYPES};
 use serde_json::Value;
 
 fn fixture(name: &str) -> Value {
