@@ -155,14 +155,20 @@ pub async fn positions<T: Transport>(api: &Alpaca<T>) -> Result<Vec<Value>, CliE
 /// Page the activities feed newest-first until it is exhausted or safely past
 /// `since`; only `types` (a comma list) when given. Rows come back exactly as
 /// the wire carried them.
+///
+/// `max_pages` bounds the walk for a host that caps how many requests one
+/// call may send (the Worker); a walk that would need more is a usage error
+/// naming what narrows it, never a silently partial history. The commands
+/// pass `None`: an export must be complete.
 pub async fn activities<T: Transport>(
     api: &Alpaca<T>,
     types: Option<&str>,
     since: &str,
+    max_pages: Option<usize>,
 ) -> Result<Vec<Value>, CliError> {
     let mut rows: Vec<Value> = Vec::new();
     let mut token: Option<String> = None;
-    loop {
+    for pages in 1.. {
         let mut query: Vec<(&str, String)> = vec![
             ("direction", "desc".to_string()),
             ("page_size", PAGE_SIZE.to_string()),
@@ -195,6 +201,13 @@ pub async fn activities<T: Transport>(
 
         if page_walk_done(n, oldest_dated.as_deref(), since) {
             break;
+        }
+        if max_pages.is_some_and(|max| pages >= max) {
+            return Err(CliError::Usage(format!(
+                "Alpaca's activity history back to {since} is more than {pages} pages of \
+                 {PAGE_SIZE} rows, more than one call may read here; pick a later `since` or \
+                 filter by `types`"
+            )));
         }
         match last_id {
             // A repeated or missing token would loop forever; refuse instead.
@@ -287,6 +300,7 @@ fn kind_of(v: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credential::ApiKeys;
     use serde_json::json;
 
     #[test]
@@ -438,6 +452,57 @@ mod tests {
         assert!(page_walk_done(100, Some("2025-11-30"), "2026-01-01"));
         // Full page, no dated rows: never guess.
         assert!(!page_walk_done(100, None, "2026-01-01"));
+    }
+
+    /// Answers every request with a full page dated `since`, so only the
+    /// budget can end the walk.
+    struct Endless(std::cell::Cell<usize>);
+
+    impl Transport for Endless {
+        async fn send(
+            &self,
+            _: pk_cli_core::transport::HttpRequest,
+        ) -> Result<pk_cli_core::transport::HttpResponse, CliError> {
+            let n = self.0.get();
+            self.0.set(n + 1);
+            let page: Vec<Value> = (0..PAGE_SIZE)
+                .map(|i| json!({"id": format!("{n}-{i}"), "date": "2026-03-01"}))
+                .collect();
+            Ok(pk_cli_core::transport::HttpResponse::new(
+                200,
+                Value::Array(page).to_string(),
+            ))
+        }
+    }
+
+    fn endless() -> Alpaca<Endless> {
+        let keys = ApiKeys {
+            key_id: "AKDUMMY000000000001".into(),
+            secret_key: "DUMMYSECRET0001".into(),
+        };
+        Alpaca::with_transport(
+            "https://api.alpaca.markets",
+            keys,
+            Endless(Default::default()),
+        )
+    }
+
+    #[test]
+    fn a_page_budget_ends_the_walk_with_a_usage_error_not_a_partial_history() {
+        let api = endless();
+        let e = pk_cli_core::block_on(activities(&api, None, "2026-01-01", Some(3))).unwrap_err();
+        assert_eq!(e.exit_code(), 2, "{e}");
+        assert!(
+            e.to_string().contains("more than 3 pages of 100 rows"),
+            "{e}"
+        );
+        assert!(e.to_string().contains("later `since`"), "{e}");
+
+        // Unbounded, the same walk runs until the history ends (here, until
+        // a page reaches two months before `since`).
+        let api = endless();
+        let rows = pk_cli_core::block_on(activities(&api, None, "2026-05-01", None)).unwrap();
+        assert_eq!(rows.len(), PAGE_SIZE);
     }
 
     #[test]

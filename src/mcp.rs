@@ -55,11 +55,21 @@ pub trait Source {
 /// each call answers, so describing the tools never needs one.
 pub struct ClientSource<T> {
     client: Result<Alpaca<T>, CliError>,
+    max_pages: Option<usize>,
 }
 
 impl<T: Transport> ClientSource<T> {
     pub fn new(client: Result<Alpaca<T>, CliError>) -> Self {
-        Self { client }
+        Self {
+            client,
+            max_pages: None,
+        }
+    }
+
+    /// At most `pages` activity pages a call (see [`reads::activities`]).
+    pub fn with_max_pages(mut self, pages: usize) -> Self {
+        self.max_pages = Some(pages);
+        self
     }
 
     fn client(&self) -> Result<&Alpaca<T>, CliError> {
@@ -77,7 +87,7 @@ impl<T: Transport> Source for ClientSource<T> {
     }
 
     async fn activities(&self, types: Option<&str>, since: &str) -> Result<Vec<Value>, CliError> {
-        reads::activities(self.client()?, types, since).await
+        reads::activities(self.client()?, types, since, self.max_pages).await
     }
 }
 
@@ -89,12 +99,11 @@ mod live {
     use std::sync::Mutex;
 
     use pk_cli_core::CliError;
-    use pk_cli_http::BlockingTransport;
     use pk_cli_secrets::CredentialStore;
     use serde_json::Value;
 
     use super::Source;
-    use crate::client::Alpaca;
+    use crate::client::{Alpaca, NativeAlpaca};
     use crate::config::Env;
     use crate::credential::{self, ApiKeys};
     use crate::reads;
@@ -137,7 +146,7 @@ mod live {
         /// A client holding the cached pair, reading it first if none is
         /// cached. One client per call: its request pacing is per process
         /// call, and the client is not `Sync`.
-        pub(crate) fn client(&self) -> Result<Alpaca<BlockingTransport>, CliError> {
+        pub(crate) fn client(&self) -> Result<NativeAlpaca, CliError> {
             let keys = {
                 // Held across the read, so parallel first calls wait for one
                 // keychain read (and at most one macOS approval) instead of
@@ -181,7 +190,7 @@ mod live {
             since: &str,
         ) -> Result<Vec<Value>, CliError> {
             let api = self.client()?;
-            self.forget_rejected(reads::activities(&api, types, since).await)
+            self.forget_rejected(reads::activities(&api, types, since, None).await)
         }
     }
 }

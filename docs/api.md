@@ -34,7 +34,7 @@ Errors are `{"code": <int>, "message": "<text>"}`; the client surfaces
 from an account restriction. Rate limit: ~200 requests/minute on the
 standard plan; the binary paces at 4 req/s and maps 429 to exit 5 without
 retrying. The Worker module ([section 6](#6-the-worker-module)) sends the same
-requests unpaced: a tool call makes at most a few.
+requests unpaced, and reads at most 40 activity pages a call.
 
 ## 2. `GET /v2/account` — OFFICIAL-DOCS (reference/getaccount-1)
 
@@ -140,6 +140,12 @@ error). The tools read:
 |---|---|
 | `alpaca_portfolio` | `GET /v2/account`, then `GET /v2/positions` |
 | `alpaca_activities` | `GET /v2/account/activities?direction=desc&page_size=100[&activity_types=<comma list>][&page_token=<last id>]`, page after page until a page has fewer than 100 rows or its oldest dated row is two calendar months before `since` |
+
+One call reads at most 40 activity pages (`MAX_ACTIVITY_PAGES`, 4,000
+rows): Cloudflare's free plan allows 50 outbound requests per invocation,
+and past that every `fetch` fails. A window whose walk needs more is a
+`usage` error that asks for a later `since` or a `types` filter; it never
+answers with part of the history. The binary's walk has no such bound.
 
 Its settings are the Worker's secrets and vars, by the CLI's own names:
 `ALP_API_KEY_ID` and `ALP_API_SECRET_KEY` (both, or the call is an auth

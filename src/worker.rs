@@ -32,6 +32,12 @@ pub const ENV: &str = "ALP_ENV";
 /// The config key for an API host override.
 pub const BASE_URL: &str = "ALP_BASE_URL";
 
+/// The most activity pages one tool call reads. Cloudflare's free plan allows
+/// 50 outbound requests per invocation; past it every `fetch` fails, so a
+/// longer walk would end in an upstream error with nothing to show for it.
+/// 40 pages is 4,000 activity rows, and leaves the Worker room for its own.
+pub const MAX_ACTIVITY_PAGES: usize = 40;
+
 pk_cli_mcp::export_wasm!(tools);
 
 /// The toolset for one call, from the Worker's config. Never fails: without
@@ -41,7 +47,7 @@ pub fn tools(config: &Value) -> AlpacaTools<ClientSource<HostTransport>> {
     let env = environment(config);
     let client = env.clone().and_then(|env| client(config, env));
     AlpacaTools::with_today(
-        ClientSource::new(client),
+        ClientSource::new(client).with_max_pages(MAX_ACTIVITY_PAGES),
         env.unwrap_or(Env::Live),
         worker_today,
     )

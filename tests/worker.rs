@@ -234,6 +234,36 @@ fn activities_page_by_token_and_filter_by_the_window() {
     );
 }
 
+/// One call reads at most `MAX_ACTIVITY_PAGES` pages, inside Cloudflare's
+/// per-invocation request cap, and says what narrows the walk rather than
+/// answering with part of the history.
+#[test]
+fn a_walk_past_the_page_budget_is_a_usage_error_after_exactly_the_budget() {
+    let mut sent = 0;
+    let out = call(
+        tools,
+        json!({"name": "alpaca_activities", "arguments": {"since": "2020-01-01"}}),
+        keys(),
+        |asked| {
+            let Asked::Fetch(req) = asked else {
+                unreachable!()
+            };
+            checked(&req, "https://api.alpaca.markets");
+            sent += 1;
+            let page: Vec<Value> = (0..100)
+                .map(|i| json!({"id": format!("{sent}-{i}"), "activity_type": "INT", "date": "2026-03-01"}))
+                .collect();
+            ok(Value::Array(page).to_string())
+        },
+    );
+    let t = text(&out);
+    assert_eq!(sent, alp::worker::MAX_ACTIVITY_PAGES);
+    assert!(sent < 50, "inside Cloudflare's free-plan cap");
+    assert!(t.starts_with("usage: "), "{t}");
+    assert!(t.contains("back to 2020-01-01"), "{t}");
+    assert!(t.contains("later `since`"), "{t}");
+}
+
 #[test]
 fn activities_over_the_fixtures_newest_first() {
     let out = call(

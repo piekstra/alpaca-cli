@@ -66,7 +66,7 @@ pub fn list_dividends(ctx: &Ctx, range: &RangeArgs) -> Result<(), CliError> {
 
 fn list(ctx: &Ctx, range: &RangeArgs, types: Option<&str>, record: &str) -> Result<(), CliError> {
     let (since, until) = resolve_range(range)?;
-    let rows = block_on(reads::activities(&ctx.api, types, &since))?;
+    let rows = block_on(reads::activities(&ctx.api, types, &since, None))?;
     let kept = keep_sorted(rows, &since, &until, range.limit);
 
     let page = Paged::new(record, kept);

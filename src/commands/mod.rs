@@ -10,9 +10,8 @@ pub mod misc;
 pub mod positions;
 
 use pk_cli_core::{CliError, CommonArgs};
-use pk_cli_http::BlockingTransport;
 
-use crate::client::Alpaca;
+use crate::client::NativeAlpaca;
 use crate::config::Env;
 
 /// Everything a provider-reading command needs, built only after arguments
@@ -20,15 +19,11 @@ use crate::config::Env;
 pub struct Ctx {
     pub common: CommonArgs,
     pub env: Env,
-    pub api: Alpaca<BlockingTransport>,
+    pub api: NativeAlpaca,
 }
 
 impl Ctx {
-    pub fn new(
-        common: CommonArgs,
-        env: Env,
-        api: Alpaca<BlockingTransport>,
-    ) -> Result<Self, CliError> {
+    pub fn new(common: CommonArgs, env: Env, api: NativeAlpaca) -> Result<Self, CliError> {
         Ok(Ctx { common, env, api })
     }
 }

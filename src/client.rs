@@ -23,38 +23,30 @@ use serde_json::Value;
 use crate::config::BIN;
 use crate::credential::ApiKeys;
 
-/// The Alpaca Trading API client over any transport: blocking reqwest
-/// natively, the Worker's `fetch` in the module.
+/// The Alpaca Trading API client over any transport: blocking reqwest, paced,
+/// natively ([`NativeAlpaca`]); the Worker's `fetch` in the module.
 pub struct Alpaca<T> {
     transport: T,
     base_url: String,
     keys: ApiKeys,
     verbose: bool,
     rejected_key_hint: Option<&'static str>,
-    /// Natively, the time of the last request, for [`MIN_REQUEST_INTERVAL`].
-    /// The Worker has no clock to sleep on and makes a few requests a call.
-    #[cfg(not(target_arch = "wasm32"))]
-    pacer: Option<std::cell::RefCell<Option<std::time::Instant>>>,
 }
 
-/// Minimum spacing between the binary's requests. Alpaca's documented budget
-/// is 200 requests/minute per key on the standard plan (docs/api.md §4);
-/// 250 ms is a polite 4/s burst floor that no CLI invocation here ever
-/// sustains long enough to matter.
-#[cfg(not(target_arch = "wasm32"))]
-pub const MIN_REQUEST_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+/// The binary's client.
+#[cfg(feature = "native")]
+pub type NativeAlpaca = Alpaca<Paced<pk_cli_http::BlockingTransport>>;
 
 #[cfg(feature = "native")]
-impl Alpaca<pk_cli_http::BlockingTransport> {
+impl NativeAlpaca {
     /// The binary's client: blocking HTTP, paced, and auth errors that name
     /// the commands that fix them.
     pub fn new(base_url: String, keys: ApiKeys, verbose: bool) -> Result<Self, CliError> {
-        let mut client =
-            Self::with_transport(&base_url, keys, pk_cli_http::BlockingTransport::new()?);
+        let transport = Paced::new(pk_cli_http::BlockingTransport::new()?);
+        let mut client = Self::with_transport(&base_url, keys, transport);
         client.verbose = verbose;
         client.rejected_key_hint =
             Some("check the environment (`alp config show`) and re-run `alp auth login`");
-        client.pacer = Some(std::cell::RefCell::new(None));
         Ok(client)
     }
 }
@@ -70,8 +62,6 @@ impl<T: Transport> Alpaca<T> {
             keys,
             verbose: false,
             rejected_key_hint: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            pacer: None,
         }
     }
 
@@ -87,9 +77,8 @@ impl<T: Transport> Alpaca<T> {
     }
 
     /// The GET for a path (leading slash, relative to the API host) with
-    /// optional query parameters, without sending it, so a test can see
-    /// exactly what goes on the wire.
-    pub fn request(&self, path: &str, query: &[(&str, String)]) -> HttpRequest {
+    /// optional query parameters.
+    fn request(&self, path: &str, query: &[(&str, String)]) -> HttpRequest {
         HttpRequest::get(format!("{}{path}", self.base_url))
             .query(query)
             .header("APCA-API-KEY-ID", &self.keys.key_id)
@@ -99,9 +88,8 @@ impl<T: Transport> Alpaca<T> {
             .user_agent(BIN, env!("CARGO_PKG_VERSION"))
     }
 
-    /// GET a path with optional query parameters (see [`Self::request`]).
+    /// GET a path with optional query parameters.
     pub async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value, CliError> {
-        self.pace();
         if self.verbose {
             // The path and parameters, never the keys.
             eprintln!("GET {}{path} {query:?}", self.base_url);
@@ -109,24 +97,91 @@ impl<T: Transport> Alpaca<T> {
         let resp = self.transport.send(self.request(path, query)).await?;
         response_json(&resp, self.rejected_key_hint)
     }
+}
 
-    /// Natively, sleep just long enough to keep under
-    /// [`MIN_REQUEST_INTERVAL`].
-    #[cfg(not(target_arch = "wasm32"))]
-    fn pace(&self) {
-        let Some(pacer) = &self.pacer else { return };
-        let mut last = pacer.borrow_mut();
-        if let Some(prev) = *last {
-            let elapsed = prev.elapsed();
-            if elapsed < MIN_REQUEST_INTERVAL {
-                std::thread::sleep(MIN_REQUEST_INTERVAL - elapsed);
-            }
-        }
-        *last = Some(std::time::Instant::now());
+#[cfg(feature = "native")]
+pub use pace::Paced;
+
+/// The binary's request spacing, as a transport around the real one, so the
+/// shared client never sleeps or reads a clock itself. The Worker sends its
+/// requests unpaced: it cannot sleep, and the module bounds how many one tool
+/// call may send (`worker::MAX_ACTIVITY_PAGES`), well inside Alpaca's
+/// 200 a minute.
+#[cfg(feature = "native")]
+mod pace {
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+
+    use pk_cli_core::transport::{HttpRequest, HttpResponse, Transport};
+    use pk_cli_core::CliError;
+
+    /// Minimum spacing between the binary's requests. Alpaca's documented
+    /// budget is 200 requests/minute per key on the standard plan
+    /// (docs/api.md §4); 250 ms is a polite 4/s burst floor that no CLI
+    /// invocation here ever sustains long enough to matter.
+    const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(250);
+
+    /// `T`, sending at most one request per [`MIN_REQUEST_INTERVAL`].
+    pub struct Paced<T> {
+        inner: T,
+        last: RefCell<Option<Instant>>,
     }
 
-    #[cfg(target_arch = "wasm32")]
-    fn pace(&self) {}
+    impl<T> Paced<T> {
+        pub fn new(inner: T) -> Self {
+            Self {
+                inner,
+                last: RefCell::new(None),
+            }
+        }
+
+        /// Sleep just long enough to keep under [`MIN_REQUEST_INTERVAL`].
+        fn wait(&self) {
+            let mut last = self.last.borrow_mut();
+            if let Some(prev) = *last {
+                let elapsed = prev.elapsed();
+                if elapsed < MIN_REQUEST_INTERVAL {
+                    std::thread::sleep(MIN_REQUEST_INTERVAL - elapsed);
+                }
+            }
+            *last = Some(Instant::now());
+        }
+    }
+
+    impl<T: Transport> Transport for Paced<T> {
+        async fn send(&self, request: HttpRequest) -> Result<HttpResponse, CliError> {
+            self.wait();
+            self.inner.send(request).await
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use pk_cli_core::block_on;
+
+        struct Answer;
+
+        impl Transport for Answer {
+            async fn send(&self, _: HttpRequest) -> Result<HttpResponse, CliError> {
+                Ok(HttpResponse::new(200, "[]"))
+            }
+        }
+
+        #[test]
+        fn requests_are_spaced_by_the_interval() {
+            let paced = Paced::new(Answer);
+            let start = Instant::now();
+            for _ in 0..3 {
+                block_on(paced.send(HttpRequest::get("https://x.test/"))).unwrap();
+            }
+            assert!(
+                start.elapsed() >= MIN_REQUEST_INTERVAL * 2,
+                "{:?}",
+                start.elapsed()
+            );
+        }
+    }
 }
 
 /// Whether `url` stays on `base`'s origin: exactly the base, or the base
@@ -147,7 +202,7 @@ pub fn same_origin(base: &str, url: &str) -> bool {
 /// message is surfaced because "HTTP 403" alone does not distinguish revoked
 /// keys from an account restriction. `hint` is the binary's remedy for
 /// rejected keys; the Worker's comes from the MCP host instead.
-pub fn response_json(resp: &HttpResponse, hint: Option<&str>) -> Result<Value, CliError> {
+fn response_json(resp: &HttpResponse, hint: Option<&str>) -> Result<Value, CliError> {
     let status = resp.status;
     if resp.is_success() {
         return serde_json::from_str(&resp.body)
