@@ -1,0 +1,569 @@
+//! `alp mcp`: an Alpaca account's balances, positions and activity as MCP
+//! tools (cli-common DESIGN.md §1.9, the MCP profile), for Claude Code,
+//! Claude Desktop and any MCP client.
+//!
+//! Two read-only tools over the same client and mapping code the commands
+//! use: `alpaca_portfolio` (the account's balances and open positions) and
+//! `alpaca_activities` (fills, dividends, interest, fees and the rest of the
+//! activities feed over a date range). Nothing here can write: the tools are
+//! reads, and the client underneath has no verb but GET.
+//!
+//! Provider access goes through [`Source`], the per-target seam of
+//! cli-common's MCP profile (DESIGN.md §2.3): async methods with no `Send`
+//! bound, so the same toolset could await a Worker's `fetch` as readily as
+//! the blocking client here. The tests run every tool offline against the
+//! fixtures through it. [`LiveSource`] reads the key pair once per process
+//! (environment first, then keychain) and only when a tool is called:
+//! listing the tools touches no credential.
+
+use std::sync::Mutex;
+
+use pk_cli_core::{dates, CliError};
+use pk_cli_mcp::{
+    parse_args, ListArgs, Page, PageRequest, Server, ToolDef, ToolError, ToolOutput, Toolset,
+};
+use pk_cli_secrets::CredentialStore;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::client::Alpaca;
+use crate::commands::activities::{self, activity_date, keep_sorted, DIVIDEND_INTEREST_TYPES};
+use crate::commands::positions::{self, Position};
+use crate::commands::{account, str_at};
+use crate::config::Env;
+use crate::credential::{self, ApiKeys};
+
+pub const PORTFOLIO_TOOL: &str = "alpaca_portfolio";
+pub const ACTIVITIES_TOOL: &str = "alpaca_activities";
+
+/// `types: ["dividends"]` stands for every dividend and interest type.
+pub const DIVIDENDS_ALIAS: &str = "dividends";
+
+/// Where the tools get Alpaca's raw rows: the live API, or fixtures.
+#[allow(async_fn_in_trait)] // deliberate: no `Send` bound, as in `Toolset`
+pub trait Source {
+    /// The account object (`GET /v2/account`).
+    async fn account(&self) -> Result<Value, CliError>;
+    /// Every open position (`GET /v2/positions`).
+    async fn positions(&self) -> Result<Vec<Value>, CliError>;
+    /// Activity rows newest first, from the newest back past `since`, as
+    /// `alp transactions list` pages them (`GET /v2/account/activities`);
+    /// only `types` (a comma list) when given.
+    async fn activities(&self, types: Option<&str>, since: &str) -> Result<Vec<Value>, CliError>;
+}
+
+/// The live API. The key pair is read once, on the first call, and kept for
+/// the life of the server; a pair Alpaca rejects is dropped so the next call
+/// reads it again (after the user fixed it in a terminal).
+pub struct LiveSource {
+    env: Env,
+    base_url: String,
+    creds: CredentialStore,
+    verbose: bool,
+    keys: Mutex<Option<ApiKeys>>,
+}
+
+impl LiveSource {
+    pub fn new(env: Env, base_url: String, creds: CredentialStore, verbose: bool) -> Self {
+        Self {
+            env,
+            base_url,
+            creds,
+            verbose,
+            keys: Mutex::new(None),
+        }
+    }
+
+    fn with_api<T>(&self, f: impl FnOnce(&Alpaca) -> Result<T, CliError>) -> Result<T, CliError> {
+        let keys = {
+            // Held across the read, so parallel first calls wait for one
+            // keychain read (and at most one macOS approval) instead of
+            // racing to raise several.
+            let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
+            if keys.is_none() {
+                *keys = Some(credential::require(&self.creds, self.env)?);
+            }
+            keys.clone().expect("set above")
+        };
+        // One client per call: its request pacing is per process call, and
+        // the client is not `Sync`.
+        let api = Alpaca::new(self.base_url.clone(), keys, self.verbose)?;
+        let out = f(&api);
+        if matches!(out, Err(CliError::Auth(_))) {
+            *self.keys.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        out
+    }
+}
+
+/// Blocking inside `async fn` is deliberate: the stdio server polls each call
+/// on its own blocking thread with no Tokio reactor (pk-cli-mcp's `Toolset`
+/// contract), which is where `reqwest::blocking` belongs.
+impl Source for LiveSource {
+    async fn account(&self) -> Result<Value, CliError> {
+        self.with_api(|a| a.get(account::PATH, &[]))
+    }
+
+    async fn positions(&self) -> Result<Vec<Value>, CliError> {
+        self.with_api(positions::fetch)
+    }
+
+    async fn activities(&self, types: Option<&str>, since: &str) -> Result<Vec<Value>, CliError> {
+        self.with_api(|a| activities::fetch(a, types, since))
+    }
+}
+
+/// The toolset `alp mcp` serves.
+pub struct AlpacaTools<S: Source> {
+    source: S,
+    env: Env,
+}
+
+impl<S: Source> AlpacaTools<S> {
+    /// `env` is the environment the source reads (`--env`, `ALP_ENV` or
+    /// config), reported in every portfolio result.
+    pub fn new(source: S, env: Env) -> Self {
+        Self { source, env }
+    }
+
+    pub fn source(&self) -> &S {
+        &self.source
+    }
+}
+
+// ---- alpaca_portfolio -------------------------------------------------------
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PortfolioArgs {
+    /// Only the position in this symbol, e.g. "AAPL".
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(flatten)]
+    pub list: ListArgs,
+}
+
+#[derive(Serialize)]
+struct PortfolioFilter<'a> {
+    symbol: Option<&'a str>,
+}
+
+#[derive(Debug, Default, Serialize, JsonSchema)]
+pub struct AccountSummary {
+    /// `live` or `paper`.
+    pub environment: String,
+    pub currency: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub equity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buying_power: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub long_market_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short_market_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_equity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern_day_trader: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daytrade_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+}
+
+impl AccountSummary {
+    fn from(v: &Value, env: Env, detailed: bool) -> Self {
+        let detail = |key: &str| if detailed { str_at(v, key) } else { None };
+        Self {
+            environment: env.as_str().to_string(),
+            currency: str_at(v, "currency").unwrap_or_else(|| "USD".into()),
+            status: str_at(v, "status"),
+            equity: str_at(v, "equity"),
+            cash: str_at(v, "cash"),
+            buying_power: str_at(v, "buying_power"),
+            long_market_value: str_at(v, "long_market_value"),
+            short_market_value: str_at(v, "short_market_value"),
+            account_number: detail("account_number"),
+            last_equity: detail("last_equity"),
+            pattern_day_trader: v
+                .get("pattern_day_trader")
+                .and_then(Value::as_bool)
+                .filter(|_| detailed),
+            daytrade_count: v
+                .get("daytrade_count")
+                .and_then(Value::as_u64)
+                .filter(|_| detailed),
+            created_at: detail("created_at"),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PositionItem {
+    pub symbol: String,
+    /// Negative for a short position.
+    pub quantity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub market_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub average_entry_price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unrealized_pl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exchange: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity_available: Option<String>,
+}
+
+impl PositionItem {
+    fn from(p: Position, detailed: bool) -> Self {
+        let amount = |m: Option<pk_cli_core::Money>| m.map(|m| m.amount);
+        let detail = |s: Option<String>| if detailed { s } else { None };
+        Self {
+            symbol: p.symbol,
+            quantity: p.quantity,
+            market_value: amount(p.market_value),
+            average_entry_price: amount(p.average_entry_price),
+            unrealized_pl: amount(p.unrealized_pl),
+            current_price: detail(amount(p.current_price)),
+            side: detail(p.side),
+            asset_class: detail(p.asset_class),
+            exchange: detail(p.exchange),
+            quantity_available: detail(p.quantity_available),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PortfolioOut {
+    pub account: AccountSummary,
+    #[serde(flatten)]
+    pub page: Page<PositionItem>,
+}
+
+// ---- alpaca_activities ------------------------------------------------------
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ActivitiesArgs {
+    /// First day, YYYY-MM-DD (inclusive). Default: 1 January of until's year.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Last day, YYYY-MM-DD (inclusive). Default: today.
+    #[serde(default)]
+    pub until: Option<String>,
+    /// Only these Alpaca activity types, e.g. ["FILL"] for trades or ["DIV",
+    /// "INT"]. "dividends" stands for every dividend and interest type (DIV*,
+    /// INT*).
+    #[serde(default)]
+    pub types: Option<Vec<String>>,
+    /// Only activity in this symbol.
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(flatten)]
+    pub list: ListArgs,
+}
+
+#[derive(Serialize)]
+struct ActivitiesFilter<'a> {
+    since: &'a str,
+    until: &'a str,
+    types: &'a [String],
+    symbol: Option<&'a str>,
+}
+
+#[derive(Debug, Default, Serialize, JsonSchema)]
+pub struct ActivityItem {
+    /// Absent only on a row Alpaca sent undated (kept, never dropped).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qty: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net_amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Concise: only when not `executed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_share_amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leaves_qty: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cum_qty: Option<String>,
+}
+
+impl ActivityItem {
+    /// Read from the verbatim activity row: a fill carries side, qty and
+    /// price; everything else net_amount and description. Nothing is
+    /// computed or rounded.
+    fn from(row: &Value, detailed: bool) -> Self {
+        let detail = |key: &str| if detailed { str_at(row, key) } else { None };
+        let status = match (str_at(row, "status"), detailed) {
+            (Some(s), false) if s == "executed" => None,
+            (s, _) => s,
+        };
+        Self {
+            date: activity_date(row),
+            kind: str_at(row, "activity_type"),
+            symbol: str_at(row, "symbol"),
+            side: str_at(row, "side"),
+            qty: str_at(row, "qty"),
+            price: str_at(row, "price"),
+            net_amount: str_at(row, "net_amount"),
+            description: str_at(row, "description").filter(|d| !d.trim().is_empty()),
+            status,
+            id: detail("id"),
+            fill_type: detail("type"),
+            order_id: detail("order_id"),
+            order_status: detail("order_status"),
+            transaction_time: detail("transaction_time"),
+            per_share_amount: detail("per_share_amount"),
+            leaves_qty: detail("leaves_qty"),
+            cum_qty: detail("cum_qty"),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ActivitiesOut {
+    /// The window read, after defaults.
+    pub since: String,
+    pub until: String,
+    #[serde(flatten)]
+    pub page: Page<ActivityItem>,
+}
+
+// ---- the toolset ------------------------------------------------------------
+
+impl<S: Source> Toolset for AlpacaTools<S> {
+    fn server(&self) -> Server {
+        Server::new("alp", env!("CARGO_PKG_VERSION"), "Alpaca", "alpaca").instructions(
+            "Alpaca access here is read-only: no tool can trade, transfer or change anything. \
+             Amounts are decimal strings at Alpaca's own precision; keep every digit when \
+             adding them.",
+        )
+    }
+
+    fn tools(&self) -> Vec<ToolDef> {
+        vec![
+            ToolDef::read(
+                PORTFOLIO_TOOL,
+                "Alpaca balances and positions",
+                "Shows the user's Alpaca brokerage account: its balances and open positions. Use \
+                 it for what they hold at Alpaca, what it is worth, and how much cash or buying \
+                 power is left. Returns account (environment, currency, status, equity, cash, \
+                 buying_power, long_market_value, short_market_value; detailed adds \
+                 account_number, last_equity, pattern_day_trader, daytrade_count, created_at) \
+                 and items, one per position, with symbol, quantity (negative when short), \
+                 market_value, average_entry_price and unrealized_pl (detailed adds \
+                 current_price, side, asset_class, exchange, quantity_available), plus returned \
+                 and next_cursor. Narrow with symbol.",
+            )
+            .input::<PortfolioArgs>()
+            .output::<PortfolioOut>(),
+            ToolDef::read(
+                ACTIVITIES_TOOL,
+                "Alpaca activity",
+                "Lists the account's activity over a date range, newest first: trade fills, \
+                 dividends, interest, fees, transfers and corporate actions. Use it for what \
+                 happened in a period, a tax year's income, or the trades behind a gain. Each \
+                 item has date and type (FILL, DIV, INT, FEE, ...) and, as the type has them, \
+                 symbol, side, qty and price (fills), net_amount (signed cash) and description; \
+                 status appears when not executed. Detailed adds id, fill_type, order_id, \
+                 order_status, transaction_time, per_share_amount, leaves_qty and cum_qty. \
+                 Returns since, until, items, returned and next_cursor. The range defaults to \
+                 the year to date; narrow with since/until, types or symbol.",
+            )
+            .input::<ActivitiesArgs>()
+            .output::<ActivitiesOut>(),
+        ]
+    }
+
+    async fn call(&self, name: &str, args: Value) -> Result<ToolOutput, ToolError> {
+        match name {
+            PORTFOLIO_TOOL => self.portfolio(parse_args(args)?).await,
+            ACTIVITIES_TOOL => self.activities(parse_args(args)?).await,
+            other => Err(ToolError::other(format!("no handler for {other}"))),
+        }
+    }
+}
+
+impl<S: Source> AlpacaTools<S> {
+    async fn portfolio(&self, args: PortfolioArgs) -> Result<ToolOutput, ToolError> {
+        let symbol = non_empty(args.symbol.as_deref());
+        let page = PageRequest::new(&args.list, &PortfolioFilter { symbol })?;
+        let detailed = args.list.format().is_detailed();
+        let account = self.source.account().await?;
+        let matched: Vec<PositionItem> = self
+            .source
+            .positions()
+            .await?
+            .iter()
+            .filter_map(Position::from_json)
+            .filter(|p| symbol.is_none_or(|s| p.symbol.eq_ignore_ascii_case(s)))
+            .map(|p| PositionItem::from(p, detailed))
+            .collect();
+        ToolOutput::new(&PortfolioOut {
+            account: AccountSummary::from(&account, self.env, detailed),
+            page: page.page(matched, "symbol")?,
+        })
+    }
+
+    async fn activities(&self, args: ActivitiesArgs) -> Result<ToolOutput, ToolError> {
+        // Everything the caller can get wrong fails before a request.
+        let (since, until) = window(
+            non_empty(args.since.as_deref()),
+            non_empty(args.until.as_deref()),
+        )?;
+        let types = expand_types(args.types.as_deref().unwrap_or_default())?;
+        let symbol = non_empty(args.symbol.as_deref());
+        let page = PageRequest::new(
+            &args.list,
+            &ActivitiesFilter {
+                since: &since,
+                until: &until,
+                types: &types,
+                symbol,
+            },
+        )?;
+        let detailed = args.list.format().is_detailed();
+
+        let filter = (!types.is_empty()).then(|| types.join(","));
+        let rows = self.source.activities(filter.as_deref(), &since).await?;
+        let matched: Vec<ActivityItem> = keep_sorted(rows, &since, &until, None)
+            .iter()
+            .filter(|r| {
+                symbol
+                    .is_none_or(|s| str_at(r, "symbol").is_some_and(|x| x.eq_ignore_ascii_case(s)))
+            })
+            .map(|r| ActivityItem::from(r, detailed))
+            .collect();
+        ToolOutput::new(&ActivitiesOut {
+            since,
+            until,
+            page: page.page(matched, "since/until, types or symbol")?,
+        })
+    }
+}
+
+fn non_empty(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// The inclusive window, defaulted as `alp transactions list` defaults it
+/// (the year to date), with errors in the tool's own words.
+fn window(since: Option<&str>, until: Option<&str>) -> Result<(String, String), ToolError> {
+    let parse = |name: &str, v: Option<&str>| {
+        v.map(|d| {
+            dates::parse_iso(d).map_err(|_| {
+                ToolError::usage(format!("{name} must be a date as YYYY-MM-DD, got `{d}`"))
+            })
+        })
+        .transpose()
+    };
+    parse("since", since)?;
+    parse("until", until)?;
+    let until = until.map_or_else(|| dates::fmt_iso(dates::today()), String::from);
+    let since = since.map_or_else(|| format!("{}-01-01", &until[..4]), String::from);
+    if since > until {
+        return Err(ToolError::usage(format!(
+            "since ({since}) is after until ({until})"
+        )));
+    }
+    Ok((since, until))
+}
+
+/// Uppercased, `dividends` expanded, duplicates dropped. A type is letters
+/// and digits only: it travels in a comma list, and Alpaca's own types are
+/// all of that shape. Unknown types are not refused (docs/api.md §3.3: the
+/// provider adds types faster than its schema says).
+fn expand_types(types: &[String]) -> Result<Vec<String>, ToolError> {
+    let mut out: Vec<String> = Vec::new();
+    for t in types {
+        let t = t.trim();
+        let expanded: Vec<String> = if t.eq_ignore_ascii_case(DIVIDENDS_ALIAS) {
+            DIVIDEND_INTEREST_TYPES
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else if t.is_empty() {
+            vec![]
+        } else if t.chars().all(|c| c.is_ascii_alphanumeric()) {
+            vec![t.to_ascii_uppercase()]
+        } else {
+            return Err(ToolError::usage(format!(
+                "types holds `{t}`; an activity type is letters and digits, e.g. FILL, DIV, INT"
+            )));
+        };
+        for e in expanded {
+            if !out.contains(&e) {
+                out.push(e);
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dividends_expands_and_types_are_uppercased_once() {
+        let got =
+            expand_types(&["Dividends".into(), "div".into(), " fill ".into(), "".into()]).unwrap();
+        assert_eq!(got[0], "DIV");
+        assert!(got.contains(&"INTNRA".to_string()));
+        assert_eq!(got.last().unwrap(), "FILL");
+        assert_eq!(got.iter().filter(|t| *t == "DIV").count(), 1);
+        let e = expand_types(&["FILL,DIV".into()]).unwrap_err();
+        assert!(e.message().contains("letters and digits"), "{e}");
+    }
+
+    #[test]
+    fn the_window_defaults_to_the_year_to_date_and_checks_its_order() {
+        let (s, u) = window(None, Some("2025-06-30")).unwrap();
+        assert_eq!((s.as_str(), u.as_str()), ("2025-01-01", "2025-06-30"));
+        let (s, u) = window(None, None).unwrap();
+        assert_eq!(s, format!("{}-01-01", &u[..4]));
+        let e = window(Some("01/02/2026"), None).unwrap_err();
+        assert!(
+            e.message()
+                .starts_with("since must be a date as YYYY-MM-DD"),
+            "{e}"
+        );
+        let e = window(Some("2026-02-01"), Some("2026-01-01")).unwrap_err();
+        assert!(e.message().contains("is after until"), "{e}");
+    }
+}

@@ -30,6 +30,10 @@ $ alp auth login            # prompts for key ID + secret key, verifies, stores 
 $ alp auth status           # auth-status/v1; add --verify to spend one request proving the keys work
 ```
 
+A run can also take the pair from the environment, which wins over the
+keychain: set both `ALP_API_KEY_ID` and `ALP_API_SECRET_KEY` (one without
+the other is an error, never a fall-back).
+
 Live is the default environment. Paper trading has its **own key pair** and
 its own keychain slot:
 
@@ -47,6 +51,7 @@ $ alp --env paper auth login
 | `alp transactions list [--since D --until D --limit N] [--type T]...` | `transaction-list/v1` | Account activities **verbatim** — fills, dividends, interest, fees; defaults to year-to-date |
 | `alp dividends list [--since D --until D --limit N]` | `dividend-list/v1` | The DIV\*/INT\* slice of the same feed — 1099-DIV/INT raw material |
 | `alp api GET <PATH>` | (provider JSON) | Raw read-only passthrough, Trading API origin only |
+| `alp mcp [--list-tools]` | (MCP over stdio) | The read-only tools for Claude ([below](#use-with-claude)) |
 | `alp auth login/status/logout/set-credential` | `auth-status/v1` | Credential lifecycle |
 | `alp config path/show/set/unset` | — | `env` (`live`/`paper`), `base_url` |
 | `alp info` | `cli-info/v1` | Machine discovery (offline) |
@@ -72,6 +77,52 @@ $ alp transactions list --since 2026-01-01 --until 2026-12-31 --json   # the tax
 $ alp transactions list --type FILL --json                             # trades only
 $ alp dividends list --json                                            # income only
 ```
+
+## Use with Claude
+
+`alp mcp` serves two read-only tools over MCP, so Claude can answer
+questions about your own Alpaca account. There is no hosted service: the
+tools run on your computer, in your copy of `alp`, and call Alpaca's
+Trading API directly with your key pair.
+
+| Tool | Answers |
+| --- | --- |
+| `alpaca_portfolio` | What do I hold, and what is it worth? Balances (equity, cash, buying power) and open positions, narrowed by `symbol` |
+| `alpaca_activities` | What happened over a period? Fills, dividends, interest, fees and the rest of the activities feed, by `since`/`until` dates (year to date by default), activity `types` (`dividends` for every dividend and interest type) and `symbol` |
+
+Results are concise by default (`response_format: "detailed"` adds ids,
+order detail and timestamps), 25 records a page with a cursor for more, and
+never larger than about 32,000 characters. Activity descriptions come from
+Alpaca and other parties; the server tells Claude to treat them as data,
+not instructions. The tools read the environment `alp` is set to
+(`--env`, `ALP_ENV` or `alp config set env`; live by default).
+
+**Claude Code.** Install `alp` and store a key pair (above), then either
+add the `alpaca-cli` plugin from the
+[piekstra plugin marketplace](https://github.com/piekstra/claude-plugins):
+
+```console
+$ claude plugin marketplace add piekstra/claude-plugins
+$ claude plugin install alpaca-cli@piekstra-plugins
+```
+
+or register the server yourself:
+
+```console
+$ claude mcp add alpaca -- alp mcp
+```
+
+**Claude Desktop.** Download `alp-<version>.mcpb` from the
+[latest release](https://github.com/piekstra/alpaca-cli/releases/latest)
+and open it. Claude Desktop asks for the key ID, the secret key and the
+environment (`live` or `paper`), keeps the keys in its own secure store,
+and passes them to the bundled binary as `ALP_API_KEY_ID`,
+`ALP_API_SECRET_KEY` and `ALP_ENV`. No separate install and no keychain are
+involved.
+
+Any other MCP client that launches a local server can run `alp mcp`. If the
+key pair is missing or rejected, the tools say so and ask you to run
+`alp auth login` in a terminal; they never sign in by themselves.
 
 ## Development
 

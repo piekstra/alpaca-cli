@@ -10,6 +10,7 @@ use pk_cli_core::{CliError, Money, Paged};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::client::Alpaca;
 use crate::commands::{str_at, Ctx};
 
 pub const PATH: &str = "/v2/positions";
@@ -70,17 +71,20 @@ fn money_at(v: &Value, key: &str) -> Option<Money> {
     str_at(v, key).map(Money::usd)
 }
 
+/// Every position row, as the wire carried it.
+pub fn fetch(api: &Alpaca) -> Result<Vec<Value>, CliError> {
+    match api.get(PATH, &[])? {
+        Value::Array(rows) => Ok(rows),
+        _ => Err(CliError::Upstream(
+            "expected a JSON array of positions — the response shape has changed; \
+             see docs/api.md"
+                .into(),
+        )),
+    }
+}
+
 pub fn list(ctx: &Ctx, limit: Option<u32>) -> Result<(), CliError> {
-    let rows = match ctx.api.get(PATH, &[])? {
-        Value::Array(rows) => rows,
-        _ => {
-            return Err(CliError::Upstream(
-                "expected a JSON array of positions — the response shape has changed; \
-                 see docs/api.md"
-                    .into(),
-            ))
-        }
-    };
+    let rows = fetch(&ctx.api)?;
     let mut positions: Vec<Position> = rows.iter().filter_map(Position::from_json).collect();
     if positions.len() < rows.len() {
         // A row we couldn't map is data loss; say so instead of quietly

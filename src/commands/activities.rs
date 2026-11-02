@@ -34,6 +34,7 @@ use pk_cli_core::dates;
 use pk_cli_core::{output, CliError, Paged, RangeArgs};
 use serde_json::Value;
 
+use crate::client::Alpaca;
 use crate::commands::{date_within, str_at, Ctx};
 
 pub const PATH: &str = "/v2/account/activities";
@@ -88,7 +89,7 @@ pub fn list_dividends(ctx: &Ctx, range: &RangeArgs) -> Result<(), CliError> {
 
 fn list(ctx: &Ctx, range: &RangeArgs, types: Option<&str>, record: &str) -> Result<(), CliError> {
     let (since, until) = resolve_range(range)?;
-    let rows = fetch(ctx, types, &since)?;
+    let rows = fetch(&ctx.api, types, &since)?;
     let kept = keep_sorted(rows, &since, &until, range.limit);
 
     let page = Paged::new(record, kept);
@@ -129,7 +130,7 @@ pub fn resolve_range(range: &RangeArgs) -> Result<(String, String), CliError> {
 
 /// Page the activities feed newest-first until it is exhausted or safely past
 /// `since`. Rows come back exactly as the wire carried them.
-fn fetch(ctx: &Ctx, types: Option<&str>, since: &str) -> Result<Vec<Value>, CliError> {
+pub fn fetch(api: &Alpaca, types: Option<&str>, since: &str) -> Result<Vec<Value>, CliError> {
     let mut rows: Vec<Value> = Vec::new();
     let mut token: Option<String> = None;
     loop {
@@ -144,7 +145,7 @@ fn fetch(ctx: &Ctx, types: Option<&str>, since: &str) -> Result<Vec<Value>, CliE
             query.push(("page_token", tok.clone()));
         }
 
-        let page = match ctx.api.get(PATH, &query)? {
+        let page = match api.get(PATH, &query)? {
             Value::Array(page) => page,
             // An empty window answers with an empty array; anything else is a
             // shape change worth failing loudly on rather than silently

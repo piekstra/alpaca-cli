@@ -18,7 +18,7 @@ docs.alpaca.markets). It exists to feed tax work:
 
 Conforms to `piekstra-cli/1` (see `~/Dev/cli-common/DESIGN.md` and
 `conformance.md`). Shared behavior comes from the `pk-cli-*` crates pinned to
-tag **v0.7.0** — reuse before writing (dates, output, `RangeArgs`, `Paged`,
+tag **v0.12.0** — reuse before writing (dates, output, `RangeArgs`, `Paged`,
 keychain, config, self-update).
 
 ## The verbatim DTO contract (do not "improve" it)
@@ -33,6 +33,28 @@ enforces this — keep it passing.
 
 `account/v1` and `position-list/v1` are curated family shapes, but their
 money amounts are still the wire's strings, untouched.
+
+## MCP tools (`alp mcp`)
+
+`src/mcp.rs` serves `alpaca_portfolio` and `alpaca_activities` over stdio
+(cli-common's `pk-cli-mcp`, DESIGN.md §1.9), reading through the same
+client and mapping code the commands use, behind a `Source` seam.
+
+- `tests/mcp_tools.rs` runs every tool in process over the fixtures, plus
+  cli-common's conformance check (names, annotations, descriptions, flat
+  inputs, output schemas, definitions under 8,000 characters).
+- `tests/mcp_stdio.rs` drives the real binary over stdio; `tests/packaging.rs`
+  holds `packaging/mcpb/manifest.json` (the Claude Desktop extension the
+  release workflow packs) to the code: version, tools, env vars.
+- **A tool never signs in.** It never prompts, starts a login or creates a
+  keychain item; a missing or rejected pair is an `auth` error telling the
+  model to have the user run `alp auth login` in a terminal. `tools/list`
+  touches no credential: the pair is read on the first call.
+- The tools are `ToolDef::read`s. A write would be its own `ToolDef::write`,
+  never mixed into a read, and none may move money.
+- The pair also comes from `ALP_API_KEY_ID` + `ALP_API_SECRET_KEY`
+  (`credential::resolve`: env before keychain; half a pair is exit 3), which
+  is how the `.mcpb` passes the values Claude Desktop stores.
 
 ## Build / test / lint
 
@@ -54,7 +76,8 @@ $ make install    # cargo install + dev-sign (see below)
 
 - Auth: two headers, `APCA-API-KEY-ID` / `APCA-API-SECRET-KEY`. The pair is
   a full-power credential (it can trade); it lives only in the OS keychain,
-  service `piekstra.alp`, one entry per environment.
+  service `piekstra.alp`, one entry per environment, or arrives per run in
+  `ALP_API_KEY_ID` + `ALP_API_SECRET_KEY` (env wins over the keychain).
 - `live` and `paper` are **different hosts with different key pairs**; the
   env names the keychain slot, so keys can't cross environments.
 - Activities paging: `page_token` = last row's id, newest-first; the client
@@ -82,5 +105,7 @@ $ make install    # cargo install + dev-sign (see below)
 `make verify` is necessary, not sufficient. After changes, `make install`
 and drive the installed binary: `alp info`, `alp auth status`,
 `alp account --json`, `alp positions --json`, `alp transactions list --json`,
-the error paths. The owner runs `alp auth login` themselves — never ask for
+the error paths. For the MCP tools, drive the installed `alp mcp` over stdio
+with JSON-RPC lines (`initialize`, `tools/list`, `tools/call`);
+`alp mcp --list-tools` prints the definitions without a credential. The owner runs `alp auth login` themselves — never ask for
 key material, and never echo it.

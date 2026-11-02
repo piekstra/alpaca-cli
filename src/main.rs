@@ -12,6 +12,7 @@ use alp::client::{self, Alpaca};
 use alp::commands::{self, Ctx};
 use alp::config::{Config, BIN, REPO};
 use alp::credential;
+use alp::mcp::{AlpacaTools, LiveSource};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use pk_cli_auth::{LoginArgs, LogoutArgs, SetCredentialArgs};
@@ -66,6 +67,9 @@ enum Command {
     Dividends(DividendsCmd),
     /// Raw read-only API passthrough (GET only, Trading API origin only).
     Api(ApiArgs),
+    /// Serve balances, positions and activity to Claude and other MCP
+    /// clients over stdio.
+    Mcp(pk_cli_mcp::McpArgs),
     /// Update to the latest release from GitHub.
     SelfUpdate(SelfUpdateArgs),
     /// Print a shell completion script.
@@ -181,6 +185,15 @@ fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Config(cmd) => {
             commands::misc::config(&cli.common, &store, cfg, cmd_to_config_op(cmd))
         }
+        // The key pair is read on a tool's first call, never at startup:
+        // listing the tools touches no credential.
+        Command::Mcp(args) => pk_cli_mcp::run(
+            args,
+            AlpacaTools::new(
+                LiveSource::new(env, base_url, creds, cli.common.verbose),
+                env,
+            ),
+        ),
         Command::Auth(cmd) => match cmd {
             AuthCmd::Login(args) => {
                 commands::auth::login(&cli.common, env, &base_url, &creds, args)
@@ -227,6 +240,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 // Handled above.
                 Command::Auth(_)
                 | Command::Config(_)
+                | Command::Mcp(_)
                 | Command::SelfUpdate(_)
                 | Command::Completions { .. }
                 | Command::Info => unreachable!("dispatched before provider setup"),

@@ -140,6 +140,88 @@ fn first_str(v: &Value, keys: &[&str]) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The API key ID, for a run that takes its key pair from the environment
+/// rather than the keychain. Claude Desktop's `.mcpb` passes its `sensitive`
+/// settings this way.
+pub const ENV_KEY_ID: &str = "ALP_API_KEY_ID";
+
+/// The API secret key that goes with [`ENV_KEY_ID`].
+pub const ENV_SECRET_KEY: &str = "ALP_API_SECRET_KEY";
+
+/// Where the key pair in use came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    /// [`ENV_KEY_ID`] and [`ENV_SECRET_KEY`].
+    Env,
+    /// The OS keychain (`piekstra.alp`, one entry per environment).
+    Keychain,
+}
+
+/// The key pair to send: the environment first, then the keychain (the
+/// family's precedence, DESIGN.md §1.7). With both variables set the
+/// keychain is never opened, so a host that passes the pair in the
+/// environment (a Claude Desktop extension) raises no keychain prompt.
+pub fn resolve(
+    creds: &CredentialStore,
+    env: Env,
+) -> Result<Option<(ApiKeys, KeySource)>, CliError> {
+    if let Some(keys) = from_env()? {
+        return Ok(Some((keys, KeySource::Env)));
+    }
+    Ok(read(creds, env)?.map(|k| (k, KeySource::Keychain)))
+}
+
+/// The pair from [`ENV_KEY_ID`] + [`ENV_SECRET_KEY`], or `None` when neither
+/// is set. One without the other, or either empty, is an auth error naming
+/// the problem: falling back to the keychain would send a key the caller did
+/// not choose.
+pub fn from_env() -> Result<Option<ApiKeys>, CliError> {
+    from_vars(env_value(ENV_KEY_ID)?, env_value(ENV_SECRET_KEY)?)
+}
+
+/// A variable that is set but not UTF-8 is an auth error naming it, not
+/// "unset": treating it as unset would fall through to the keychain.
+fn env_value(name: &str) -> Result<Option<String>, CliError> {
+    match std::env::var(name) {
+        Ok(v) => Ok(Some(v)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(CliError::Auth(format!(
+            "{name} is set but is not valid UTF-8; set it to the value from the Alpaca dashboard"
+        ))),
+    }
+}
+
+fn from_vars(key_id: Option<String>, secret: Option<String>) -> Result<Option<ApiKeys>, CliError> {
+    let half = |set: &str, missing: &str| {
+        CliError::Auth(format!(
+            "{set} is set but {missing} is not; set both (the key ID and the secret key from \
+             the Alpaca dashboard) or neither"
+        ))
+    };
+    match (key_id, secret) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(half(ENV_KEY_ID, ENV_SECRET_KEY)),
+        (None, Some(_)) => Err(half(ENV_SECRET_KEY, ENV_KEY_ID)),
+        (Some(k), Some(s)) => {
+            let (k, s) = (k.trim().to_string(), s.trim().to_string());
+            if k.is_empty() || s.is_empty() {
+                let empty = if k.is_empty() {
+                    ENV_KEY_ID
+                } else {
+                    ENV_SECRET_KEY
+                };
+                return Err(CliError::Auth(format!(
+                    "{empty} is set but empty; set it to the value from the Alpaca dashboard"
+                )));
+            }
+            Ok(Some(ApiKeys {
+                key_id: k,
+                secret_key: s,
+            }))
+        }
+    }
+}
+
 /// Read the stored key pair for an environment. `None` when nothing is stored.
 pub fn read(creds: &CredentialStore, env: Env) -> Result<Option<ApiKeys>, CliError> {
     match creds.get(env.as_str())? {
@@ -157,14 +239,22 @@ pub fn read(creds: &CredentialStore, env: Env) -> Result<Option<ApiKeys>, CliErr
     }
 }
 
-/// Read the stored key pair, or fail as auth (exit 3) pointing at login.
+/// The key pair to send ([`resolve`]: environment, then keychain), or fail
+/// as auth (exit 3) pointing at login.
 pub fn require(creds: &CredentialStore, env: Env) -> Result<ApiKeys, CliError> {
-    read(creds, env)?.ok_or_else(|| {
-        CliError::Auth(format!(
-            "no Alpaca API keys stored for the `{}` environment — run `alp auth login`",
-            env.as_str()
-        ))
-    })
+    resolve(creds, env)?
+        .map(|(keys, _)| keys)
+        .ok_or_else(|| missing(env))
+}
+
+/// The auth error for no key pair anywhere: it names the login and the
+/// environment variables, the two ways to supply one.
+pub fn missing(env: Env) -> CliError {
+    CliError::Auth(format!(
+        "no Alpaca API keys stored for the `{}` environment — run `alp auth login`, or set \
+         {ENV_KEY_ID} and {ENV_SECRET_KEY}",
+        env.as_str()
+    ))
 }
 
 /// Store the key pair for an environment.
@@ -207,6 +297,44 @@ mod tests {
             2
         );
         assert_eq!(ApiKeys::parse("a:\n").unwrap_err().exit_code(), 2);
+    }
+
+    fn some(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    #[test]
+    fn the_environment_pair_is_both_or_neither() {
+        assert!(from_vars(None, None).unwrap().is_none());
+        let k = from_vars(some(" AKDUMMY000000000001 "), some("DUMMYSECRET0001\n"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(k.key_id, "AKDUMMY000000000001");
+        assert_eq!(k.secret_key, "DUMMYSECRET0001");
+
+        let e = from_vars(some("AKDUMMY000000000001"), None).unwrap_err();
+        assert_eq!(e.exit_code(), 3);
+        assert!(e.to_string().contains(ENV_SECRET_KEY), "{e}");
+        let e = from_vars(None, some("DUMMYSECRET0001")).unwrap_err();
+        assert!(e.to_string().contains(ENV_KEY_ID), "{e}");
+        let e = from_vars(some("AKDUMMY000000000001"), some("  ")).unwrap_err();
+        assert_eq!(e.exit_code(), 3);
+        assert!(e.to_string().contains("empty"), "{e}");
+    }
+
+    #[test]
+    fn the_missing_key_error_names_both_ways_in() {
+        let e = missing(Env::Paper);
+        assert_eq!(e.exit_code(), 3);
+        let text = e.to_string();
+        assert!(
+            text.contains("`paper`") && text.contains("alp auth login"),
+            "{text}"
+        );
+        assert!(
+            text.contains(ENV_KEY_ID) && text.contains(ENV_SECRET_KEY),
+            "{text}"
+        );
     }
 
     #[test]
