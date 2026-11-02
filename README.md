@@ -82,8 +82,9 @@ $ alp dividends list --json                                            # income 
 
 `alp mcp` serves two read-only tools over MCP, so Claude can answer
 questions about your own Alpaca account. There is no hosted service: the
-tools run on your computer, in your copy of `alp`, and call Alpaca's
-Trading API directly with your key pair.
+tools run on your computer, in your copy of `alp`, or in a Cloudflare Worker
+in your own account ([below](#claude-on-the-web-and-mobile)), and call
+Alpaca's Trading API directly with your key pair.
 
 | Tool | Answers |
 | --- | --- |
@@ -123,6 +124,36 @@ involved.
 Any other MCP client that launches a local server can run `alp mcp`. If the
 key pair is missing or rejected, the tools say so and ask you to run
 `alp auth login` in a terminal; they never sign in by themselves.
+
+### Claude on the web and mobile
+
+claude.ai and the Claude apps cannot start a program on your computer. They
+reach the same two tools through the
+[deploy-your-own connector](https://github.com/piekstra/cli-common/tree/main/connector):
+a Cloudflare Worker in your own free Cloudflare account. Each release
+attaches the tools as a WebAssembly module (`alp-mcp-<version>.wasm`, with
+its `.sha256`), and the Worker runs the same `alp` code. The Worker holds your
+key pair as its own secrets and calls Alpaca directly; no service of ours
+sees the keys or the data.
+
+| Worker setting | Value |
+| --- | --- |
+| `ALP_API_KEY_ID` (secret) | the key ID |
+| `ALP_API_SECRET_KEY` (secret) | the secret key |
+| `ALP_ENV` (variable, optional) | `live` (the default) or `paper` |
+
+Leave both keys `none` and the connector serves no Alpaca tools. To add
+Alpaca to a connector you already deployed, follow
+[Adding Alpaca to a deployment you already have](https://github.com/piekstra/cli-common/tree/main/connector#adding-alpaca-to-a-deployment-you-already-have).
+Alpaca has no read-only keys: the module sends `GET` requests only, but a
+pair that leaks from the Worker can trade, so regenerate it in the Alpaca
+dashboard at once if that happens. When the keys are missing or rejected,
+the tools ask you to update the Worker's secrets.
+
+In the Worker, one `alpaca_activities` call reads at most 40 pages of the
+feed (4,000 rows), newest first, and rows newer than `until` count toward
+them. A window further back is refused with a suggestion: a later `since`, a
+`types` filter, or `alp transactions list`, which has no such limit.
 
 ## Development
 
