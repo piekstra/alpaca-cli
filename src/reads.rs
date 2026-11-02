@@ -156,16 +156,16 @@ pub async fn positions<T: Transport>(api: &Alpaca<T>) -> Result<Vec<Value>, CliE
 /// `since`; only `types` (a comma list) when given. Rows come back exactly as
 /// the wire carried them.
 ///
-/// `max_pages` bounds the walk for a host that caps how many requests one
-/// call may send (the Worker); a walk that would need more is a usage error
-/// naming what narrows it, never a silently partial history. The commands
-/// pass `None`: an export must be complete.
+/// `bounded` is for a host that caps how many requests one call may send
+/// (the Worker; see [`Bounded`]). The commands pass `None`: an export must be
+/// complete, and the walk is then exactly the one docs/api.md §3 describes.
 pub async fn activities<T: Transport>(
     api: &Alpaca<T>,
     types: Option<&str>,
     since: &str,
-    max_pages: Option<usize>,
+    bounded: Option<Bounded<'_>>,
 ) -> Result<Vec<Value>, CliError> {
+    let start = bounded.as_ref().and_then(|b| server_until(b.until));
     let mut rows: Vec<Value> = Vec::new();
     let mut token: Option<String> = None;
     for pages in 1.. {
@@ -175,6 +175,9 @@ pub async fn activities<T: Transport>(
         ];
         if let Some(t) = types {
             query.push(("activity_types", t.to_string()));
+        }
+        if let Some(until) = &start {
+            query.push(("until", until.clone()));
         }
         if let Some(tok) = &token {
             query.push(("page_token", tok.clone()));
@@ -202,11 +205,12 @@ pub async fn activities<T: Transport>(
         if page_walk_done(n, oldest_dated.as_deref(), since) {
             break;
         }
-        if max_pages.is_some_and(|max| pages >= max) {
+        if let Some(b) = bounded.as_ref().filter(|b| pages >= b.max_pages) {
             return Err(CliError::Usage(format!(
-                "Alpaca's activity history back to {since} is more than {pages} pages of \
-                 {PAGE_SIZE} rows, more than one call may read here; pick a later `since` or \
-                 filter by `types`"
+                "Alpaca's activity from {since} to {} is more than {pages} pages of {PAGE_SIZE} \
+                 rows, more than one call may read here; split the window into shorter ones or \
+                 filter by `types`",
+                b.until
             )));
         }
         match last_id {
@@ -216,6 +220,32 @@ pub async fn activities<T: Transport>(
         }
     }
     Ok(rows)
+}
+
+/// A walk bounded for a host that caps the requests one call may send (the
+/// Worker). It reads at most `max_pages` pages; one that would need more is a
+/// usage error naming what narrows it, never a silently partial history. It
+/// starts near the window's end (`until`, inclusive) rather than at the
+/// newest row, so an old window's pages are not spent on the years since.
+pub struct Bounded<'a> {
+    pub until: &'a str,
+    pub max_pages: usize,
+}
+
+/// The server-side `until` a bounded walk ending at `until` starts from:
+/// midnight UTC on the first day of the third month after it. The server's
+/// bound is on creation time and exclusive (docs/api.md §3 trap), so it is
+/// padded by at least the two calendar months the far end's stop rule allows
+/// late-processed rows; the inclusive filter still runs on the rows.
+fn server_until(until: &str) -> Option<String> {
+    let y: i32 = until.get(0..4)?.parse().ok()?;
+    let m: i32 = until.get(5..7)?.parse().ok()?;
+    let month = y * 12 + (m - 1) + 3;
+    Some(format!(
+        "{:04}-{:02}-01T00:00:00Z",
+        month / 12,
+        month % 12 + 1
+    ))
 }
 
 /// Whether the newest-first walk can stop: the history is exhausted (short
@@ -490,19 +520,43 @@ mod tests {
     #[test]
     fn a_page_budget_ends_the_walk_with_a_usage_error_not_a_partial_history() {
         let api = endless();
-        let e = pk_cli_core::block_on(activities(&api, None, "2026-01-01", Some(3))).unwrap_err();
+        let bounded = Bounded {
+            until: "2026-12-31",
+            max_pages: 3,
+        };
+        let e =
+            pk_cli_core::block_on(activities(&api, None, "2026-01-01", Some(bounded))).unwrap_err();
         assert_eq!(e.exit_code(), 2, "{e}");
         assert!(
-            e.to_string().contains("more than 3 pages of 100 rows"),
+            e.to_string()
+                .contains("from 2026-01-01 to 2026-12-31 is more than 3 pages of 100 rows"),
             "{e}"
         );
-        assert!(e.to_string().contains("later `since`"), "{e}");
+        assert!(e.to_string().contains("split the window"), "{e}");
+        assert_eq!(api.transport().0.get(), 3);
 
         // Unbounded, the same walk runs until the history ends (here, until
         // a page reaches two months before `since`).
         let api = endless();
         let rows = pk_cli_core::block_on(activities(&api, None, "2026-05-01", None)).unwrap();
         assert_eq!(rows.len(), PAGE_SIZE);
+    }
+
+    #[test]
+    fn a_bounded_walk_starts_two_to_three_months_past_the_window() {
+        assert_eq!(server_until("2024-12-31").unwrap(), "2025-03-01T00:00:00Z");
+        assert_eq!(server_until("2024-12-01").unwrap(), "2025-03-01T00:00:00Z");
+        assert_eq!(server_until("2026-10-05").unwrap(), "2027-01-01T00:00:00Z");
+        assert_eq!(server_until("2026-01-15").unwrap(), "2026-04-01T00:00:00Z");
+        assert_eq!(server_until("2026-09-30").unwrap(), "2026-12-01T00:00:00Z");
+        // Each stays at least two calendar months past its end.
+        for until in ["2024-12-31", "2026-10-05", "2026-01-15", "2026-09-30"] {
+            assert!(
+                months_between(until, &server_until(until).unwrap()) >= 2,
+                "{until}"
+            );
+        }
+        assert_eq!(server_until("yesterday"), None);
     }
 
     #[test]

@@ -69,6 +69,11 @@ impl<T: Transport> Alpaca<T> {
         &self.base_url
     }
 
+    #[cfg(test)]
+    pub(crate) fn transport(&self) -> &T {
+        &self.transport
+    }
+
     /// Whether a caller-supplied absolute URL stays on the configured API
     /// origin. Anything dereferenced by this client carries the account's key
     /// headers, so an off-origin URL would hand the credential to a stranger.

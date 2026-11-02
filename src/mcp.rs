@@ -44,10 +44,17 @@ pub trait Source {
     async fn account(&self) -> Result<Value, CliError>;
     /// Every open position (`GET /v2/positions`).
     async fn positions(&self) -> Result<Vec<Value>, CliError>;
-    /// Activity rows newest first, from the newest back past `since`, as
-    /// `alp transactions list` pages them (`GET /v2/account/activities`);
-    /// only `types` (a comma list) when given.
-    async fn activities(&self, types: Option<&str>, since: &str) -> Result<Vec<Value>, CliError>;
+    /// Activity rows newest first, back past `since`, as `alp transactions
+    /// list` pages them (`GET /v2/account/activities`); only `types` (a comma
+    /// list) when given. `until` is the window's inclusive end: rows after it
+    /// may come back too (the tools filter), and a bounded source starts its
+    /// walk near it.
+    async fn activities(
+        &self,
+        types: Option<&str>,
+        since: &str,
+        until: &str,
+    ) -> Result<Vec<Value>, CliError>;
 }
 
 /// The live API over any transport, from a client built up front: the Worker
@@ -66,7 +73,8 @@ impl<T: Transport> ClientSource<T> {
         }
     }
 
-    /// At most `pages` activity pages a call (see [`reads::activities`]).
+    /// At most `pages` activity pages a call, walked from near the window's
+    /// end ([`reads::Bounded`]).
     pub fn with_max_pages(mut self, pages: usize) -> Self {
         self.max_pages = Some(pages);
         self
@@ -86,8 +94,16 @@ impl<T: Transport> Source for ClientSource<T> {
         reads::positions(self.client()?).await
     }
 
-    async fn activities(&self, types: Option<&str>, since: &str) -> Result<Vec<Value>, CliError> {
-        reads::activities(self.client()?, types, since, self.max_pages).await
+    async fn activities(
+        &self,
+        types: Option<&str>,
+        since: &str,
+        until: &str,
+    ) -> Result<Vec<Value>, CliError> {
+        let bounded = self
+            .max_pages
+            .map(|max_pages| reads::Bounded { until, max_pages });
+        reads::activities(self.client()?, types, since, bounded).await
     }
 }
 
@@ -188,6 +204,7 @@ mod live {
             &self,
             types: Option<&str>,
             since: &str,
+            _until: &str,
         ) -> Result<Vec<Value>, CliError> {
             let api = self.client()?;
             self.forget_rejected(reads::activities(&api, types, since, None).await)
@@ -564,7 +581,10 @@ impl<S: Source> AlpacaTools<S> {
         let detailed = args.list.format().is_detailed();
 
         let filter = (!types.is_empty()).then(|| types.join(","));
-        let rows = self.source.activities(filter.as_deref(), &since).await?;
+        let rows = self
+            .source
+            .activities(filter.as_deref(), &since, &until)
+            .await?;
         let matched: Vec<ActivityItem> = keep_sorted(rows, &since, &until, None)
             .iter()
             .filter(|r| {

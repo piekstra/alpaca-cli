@@ -27,7 +27,7 @@ impl Source for NoSource {
     async fn positions(&self) -> Result<Vec<Value>, CliError> {
         unreachable!()
     }
-    async fn activities(&self, _: Option<&str>, _: &str) -> Result<Vec<Value>, CliError> {
+    async fn activities(&self, _: Option<&str>, _: &str, _: &str) -> Result<Vec<Value>, CliError> {
         unreachable!()
     }
 }

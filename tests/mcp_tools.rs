@@ -73,7 +73,12 @@ impl Source for Fixtures {
     }
 
     /// As the live walk does, the server-side type filter applies here.
-    async fn activities(&self, types: Option<&str>, since: &str) -> Result<Vec<Value>, CliError> {
+    async fn activities(
+        &self,
+        types: Option<&str>,
+        since: &str,
+        _: &str,
+    ) -> Result<Vec<Value>, CliError> {
         self.fetches
             .lock()
             .unwrap()
