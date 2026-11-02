@@ -6,12 +6,19 @@
 //! [`ApiKeys`] implements [`std::fmt::Debug`] **by hand** so a stray `{:?}`
 //! in a future debug session cannot print the secret key to a terminal or a
 //! log file.
+//!
+//! The keychain and environment readers are the binary's (feature `native`).
+//! The Worker module reads the same two names from its secrets
+//! ([`crate::worker`]) and holds them to the same both-or-neither rule
+//! ([`from_vars`]).
 
 use pk_cli_core::CliError;
+#[cfg(feature = "native")]
 use pk_cli_secrets::{CredentialStore, Secret};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(feature = "native")]
 use crate::config::Env;
 
 /// An Alpaca API key pair, as issued on the dashboard's "API Keys" panel.
@@ -118,6 +125,7 @@ impl ApiKeys {
         mask(&self.key_id)
     }
 
+    #[cfg(feature = "native")]
     fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
@@ -149,6 +157,7 @@ pub const ENV_KEY_ID: &str = "ALP_API_KEY_ID";
 pub const ENV_SECRET_KEY: &str = "ALP_API_SECRET_KEY";
 
 /// Where the key pair in use came from.
+#[cfg(feature = "native")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySource {
     /// [`ENV_KEY_ID`] and [`ENV_SECRET_KEY`].
@@ -161,6 +170,7 @@ pub enum KeySource {
 /// family's precedence, DESIGN.md §1.7). With both variables set the
 /// keychain is never opened, so a host that passes the pair in the
 /// environment (a Claude Desktop extension) raises no keychain prompt.
+#[cfg(feature = "native")]
 pub fn resolve(
     creds: &CredentialStore,
     env: Env,
@@ -171,6 +181,7 @@ pub fn resolve(
 /// [`resolve`]'s precedence over its two sources: the environment's answer,
 /// and a keychain read that runs only when the environment holds no pair. An
 /// environment error (half a pair) stops there, never falling back.
+#[cfg(feature = "native")]
 fn resolve_with(
     from_env: Result<Option<ApiKeys>, CliError>,
     keychain: impl FnOnce() -> Result<Option<ApiKeys>, CliError>,
@@ -184,12 +195,14 @@ fn resolve_with(
 /// is set. One without the other, or either empty, is an auth error naming
 /// the problem: falling back to the keychain would send a key the caller did
 /// not choose.
+#[cfg(feature = "native")]
 pub fn from_env() -> Result<Option<ApiKeys>, CliError> {
     from_vars(env_value(ENV_KEY_ID)?, env_value(ENV_SECRET_KEY)?)
 }
 
 /// A variable that is set but not UTF-8 is an auth error naming it, not
 /// "unset": treating it as unset would fall through to the keychain.
+#[cfg(feature = "native")]
 fn env_value(name: &str) -> Result<Option<String>, CliError> {
     match std::env::var(name) {
         Ok(v) => Ok(Some(v)),
@@ -200,7 +213,13 @@ fn env_value(name: &str) -> Result<Option<String>, CliError> {
     }
 }
 
-fn from_vars(key_id: Option<String>, secret: Option<String>) -> Result<Option<ApiKeys>, CliError> {
+/// The pair from its two values, wherever they were read: `None` when
+/// neither is set; one without the other, or either empty, an auth error
+/// naming the problem.
+pub fn from_vars(
+    key_id: Option<String>,
+    secret: Option<String>,
+) -> Result<Option<ApiKeys>, CliError> {
     let half = |set: &str, missing: &str| {
         CliError::Auth(format!(
             "{set} is set but {missing} is not; set both (the key ID and the secret key from \
@@ -232,6 +251,7 @@ fn from_vars(key_id: Option<String>, secret: Option<String>) -> Result<Option<Ap
 }
 
 /// Read the stored key pair for an environment. `None` when nothing is stored.
+#[cfg(feature = "native")]
 pub fn read(creds: &CredentialStore, env: Env) -> Result<Option<ApiKeys>, CliError> {
     match creds.get(env.as_str())? {
         Some(secret) => {
@@ -250,6 +270,7 @@ pub fn read(creds: &CredentialStore, env: Env) -> Result<Option<ApiKeys>, CliErr
 
 /// The key pair to send ([`resolve`]: environment, then keychain), or fail
 /// as auth (exit 3) pointing at login.
+#[cfg(feature = "native")]
 pub fn require(creds: &CredentialStore, env: Env) -> Result<ApiKeys, CliError> {
     resolve(creds, env)?
         .map(|(keys, _)| keys)
@@ -258,6 +279,7 @@ pub fn require(creds: &CredentialStore, env: Env) -> Result<ApiKeys, CliError> {
 
 /// The auth error for no key pair anywhere: it names the login and the
 /// environment variables, the two ways to supply one.
+#[cfg(feature = "native")]
 pub fn missing(env: Env) -> CliError {
     CliError::Auth(format!(
         "no Alpaca API keys stored for the `{}` environment — run `alp auth login`, or set \
@@ -267,6 +289,7 @@ pub fn missing(env: Env) -> CliError {
 }
 
 /// Store the key pair for an environment.
+#[cfg(feature = "native")]
 pub fn write(creds: &CredentialStore, env: Env, keys: &ApiKeys) -> Result<(), CliError> {
     creds.set(env.as_str(), &Secret::new(keys.to_json()))
 }
@@ -331,6 +354,7 @@ mod tests {
         assert!(e.to_string().contains("empty"), "{e}");
     }
 
+    #[cfg(feature = "native")]
     fn pair(id: &str) -> ApiKeys {
         ApiKeys {
             key_id: id.into(),
@@ -338,6 +362,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn the_environment_wins_and_the_keychain_is_then_never_read() {
         let got = resolve_with(Ok(Some(pair("AKDUMMYENV00000001"))), || {
@@ -349,6 +374,7 @@ mod tests {
         assert_eq!(got.1, KeySource::Env);
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn the_keychain_answers_only_when_the_environment_is_empty() {
         let got = resolve_with(Ok(None), || Ok(Some(pair("AKDUMMYKEYCHAIN0001"))))
@@ -359,6 +385,7 @@ mod tests {
         assert!(resolve_with(Ok(None), || Ok(None)).unwrap().is_none());
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn half_a_pair_in_the_environment_never_falls_back_to_the_keychain() {
         let half = from_vars(some("AKDUMMY000000000001"), None);
@@ -370,6 +397,7 @@ mod tests {
         assert!(e.to_string().contains(ENV_SECRET_KEY), "{e}");
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn the_missing_key_error_names_both_ways_in() {
         let e = missing(Env::Paper);

@@ -127,7 +127,8 @@ key pair is missing or rejected, the tools say so and ask you to run
 ## Development
 
 ```console
-$ make verify   # fmt-check + clippy -D warnings + offline tests + smoke — the gate
+$ make verify   # fmt-check + clippy -D warnings + offline tests + wasm32 clippy + smoke — the gate
+$ make wasm     # the MCP tools as a WebAssembly module for a Cloudflare Worker
 ```
 
 Tests are fully offline (no network, no keychain). Fixtures are synthetic —

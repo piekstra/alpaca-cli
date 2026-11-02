@@ -1,7 +1,7 @@
 [package]
 name = "alpaca-cli"
 description = "Read-only CLI for Alpaca brokerage accounts (piekstra-cli/1), over the official Trading API."
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # pk-cli-mcp (rmcp 3.8, the `stdio` feature) needs 1.88.
 rust-version = "1.88"
@@ -18,30 +18,56 @@ path = "src/lib.rs"
 [[bin]]
 name = "alp"
 path = "src/main.rs"
+required-features = ["native"]
+
+[features]
+default = ["native"]
+# Everything the terminal binary needs and a Cloudflare Worker cannot have:
+# the OS keychain, clap, self-update, the blocking HTTP client, and the stdio
+# MCP server.
+native = [
+    "dep:clap",
+    "dep:clap_complete",
+    "dep:pk-cli-secrets",
+    "dep:pk-cli-config",
+    "dep:pk-cli-selfupdate",
+    "dep:pk-cli-auth",
+    "dep:pk-cli-http",
+    "pk-cli-mcp/stdio",
+]
+# The MCP tools as a WebAssembly module for the deploy-your-own Worker
+# (cli-common's connector/): build the library with `make wasm`, which runs
+#   cargo rustc --lib --crate-type cdylib --release \
+#     --target wasm32-unknown-unknown --no-default-features --features wasm
+# Natively it builds too, for the tests that drive the Worker toolset through
+# pk-cli-mcp's stand-in host (`cargo test --features wasm`).
+wasm = ["pk-cli-mcp/wasm"]
 
 [dependencies]
-pk-cli-core = { git = "https://github.com/piekstra/cli-common", tag = "v0.12.0", features = ["reqwest"] }
-pk-cli-secrets = { git = "https://github.com/piekstra/cli-common", tag = "v0.12.0" }
-pk-cli-config = { git = "https://github.com/piekstra/cli-common", tag = "v0.12.0" }
-pk-cli-selfupdate = { git = "https://github.com/piekstra/cli-common", tag = "v0.12.0" }
-pk-cli-auth = { git = "https://github.com/piekstra/cli-common", tag = "v0.12.0" }
-pk-cli-http = { git = "https://github.com/piekstra/cli-common", tag = "v0.12.0" }
-# `alp mcp`: the MCP profile's tools over the same commands (DESIGN.md §1.9).
-pk-cli-mcp = { git = "https://github.com/piekstra/cli-common", tag = "v0.12.0", features = ["stdio"] }
+pk-cli-core = { git = "https://github.com/piekstra/cli-common", tag = "v0.14.0" }
+pk-cli-secrets = { git = "https://github.com/piekstra/cli-common", tag = "v0.14.0", optional = true }
+pk-cli-config = { git = "https://github.com/piekstra/cli-common", tag = "v0.14.0", optional = true }
+pk-cli-selfupdate = { git = "https://github.com/piekstra/cli-common", tag = "v0.14.0", optional = true }
+pk-cli-auth = { git = "https://github.com/piekstra/cli-common", tag = "v0.14.0", optional = true }
+# The blocking HTTP client, behind pk-cli-core's `Transport`.
+pk-cli-http = { git = "https://github.com/piekstra/cli-common", tag = "v0.14.0", optional = true }
+# The MCP profile's tools over the same client (DESIGN.md §1.9): `alp mcp`
+# with `native`, the Worker module with `wasm`.
+pk-cli-mcp = { git = "https://github.com/piekstra/cli-common", tag = "v0.14.0" }
 schemars = "1"
 
-clap = { version = "4", features = ["derive", "env"] }
-clap_complete = "4"
+clap = { version = "4", features = ["derive", "env"], optional = true }
+clap_complete = { version = "4", optional = true }
 serde = { version = "1", features = ["derive"] }
 # preserve_order keeps JSON object key order at insertion order, which is what
 # SPEC v1 §1.4 promises for rendered output — and what keeps the verbatim
 # activity rows in `transaction-list/v1` byte-comparable to the wire.
 serde_json = { version = "1", features = ["preserve_order"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [dev-dependencies]
-# The MCP profile's conformance checks, for the tests only.
-pk-cli-mcp = { git = "https://github.com/piekstra/cli-common", tag = "v0.12.0", features = ["test-util"] }
+# The MCP profile's conformance checks and, with `wasm`, the stand-in host,
+# for the tests only.
+pk-cli-mcp = { git = "https://github.com/piekstra/cli-common", tag = "v0.14.0", features = ["test-util"] }
 assert_cmd = "2"
 predicates = "3"
 

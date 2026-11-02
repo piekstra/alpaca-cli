@@ -5,12 +5,11 @@
 //! flag. Money fields arrive from Alpaca as **string decimals** and are
 //! carried into `Money` untouched — no parsing, no rounding.
 
-use pk_cli_core::{output, CliError, Money};
+use pk_cli_core::{block_on, output, CliError, Money};
 use serde_json::{Map, Value};
 
-use crate::commands::{str_at, Ctx};
-
-pub const PATH: &str = "/v2/account";
+use crate::commands::Ctx;
+use crate::reads::{self, str_at};
 
 /// The money fields the DTO surfaces, in render order.
 const MONEY_FIELDS: &[&str] = &[
@@ -23,7 +22,7 @@ const MONEY_FIELDS: &[&str] = &[
 ];
 
 pub fn show(ctx: &Ctx) -> Result<(), CliError> {
-    let v = ctx.api.get(PATH, &[])?;
+    let v = block_on(reads::account(&ctx.api))?;
     let dto = account_dto(&v);
     output::emit(ctx.common.json, "account", dto, output::render);
     Ok(())

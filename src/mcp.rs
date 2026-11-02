@@ -10,29 +10,26 @@
 //!
 //! Provider access goes through [`Source`], the per-target seam of
 //! cli-common's MCP profile (DESIGN.md §2.3): async methods with no `Send`
-//! bound, so the same toolset could await a Worker's `fetch` as readily as
-//! the blocking client here. The tests run every tool offline against the
-//! fixtures through it. [`LiveSource`] reads the key pair once per process
-//! (environment first, then keychain) and only when a tool is called:
-//! listing the tools touches no credential.
+//! bound, so one toolset serves both hosts. [`LiveSource`] is `alp mcp`'s:
+//! it reads the key pair once per process (environment first, then keychain)
+//! and only when a tool is called, so listing the tools touches no
+//! credential. [`ClientSource`] is the Worker module's ([`crate::worker`]):
+//! the same client over the Worker's `fetch`. The tests run every tool
+//! offline against the fixtures through the seam.
 
-use std::sync::Mutex;
-
-use pk_cli_core::{dates, CliError};
+use pk_cli_core::dates::{self, Civil};
+use pk_cli_core::transport::Transport;
+use pk_cli_core::CliError;
 use pk_cli_mcp::{
     parse_args, ListArgs, Page, PageRequest, Server, ToolDef, ToolError, ToolOutput, Toolset,
 };
-use pk_cli_secrets::CredentialStore;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::client::Alpaca;
-use crate::commands::activities::{self, activity_date, keep_sorted, DIVIDEND_INTEREST_TYPES};
-use crate::commands::positions::{self, Position};
-use crate::commands::{account, str_at};
 use crate::config::Env;
-use crate::credential::{self, ApiKeys};
+use crate::reads::{self, activity_date, keep_sorted, str_at, Position, DIVIDEND_INTEREST_TYPES};
 
 pub const PORTFOLIO_TOOL: &str = "alpaca_portfolio";
 pub const ACTIVITIES_TOOL: &str = "alpaca_activities";
@@ -53,95 +50,166 @@ pub trait Source {
     async fn activities(&self, types: Option<&str>, since: &str) -> Result<Vec<Value>, CliError>;
 }
 
-/// Reads the key pair: `credential::require` live, a stub in tests.
-type KeyLoader = Box<dyn Fn() -> Result<ApiKeys, CliError> + Send + Sync>;
-
-/// The live API. The key pair is read once, on the first call, and kept for
-/// the life of the server; a pair Alpaca rejects is dropped so the next call
-/// reads it again (after the user fixed it in a terminal).
-pub struct LiveSource {
-    base_url: String,
-    verbose: bool,
-    load: KeyLoader,
-    keys: Mutex<Option<ApiKeys>>,
+/// The live API over any transport, from a client built up front: the Worker
+/// module's source. A key pair that could not be read is kept as the error
+/// each call answers, so describing the tools never needs one.
+pub struct ClientSource<T> {
+    client: Result<Alpaca<T>, CliError>,
 }
 
-impl LiveSource {
-    /// Reads the pair as every command does ([`credential::require`]:
-    /// environment, then keychain).
-    pub fn new(env: Env, base_url: String, creds: CredentialStore, verbose: bool) -> Self {
-        Self::with_loader(
-            base_url,
-            verbose,
-            Box::new(move || credential::require(&creds, env)),
-        )
+impl<T: Transport> ClientSource<T> {
+    pub fn new(client: Result<Alpaca<T>, CliError>) -> Self {
+        Self { client }
     }
 
-    /// With the pair from `load`, for tests of the caching.
-    pub fn with_loader(base_url: String, verbose: bool, load: KeyLoader) -> Self {
-        Self {
-            base_url,
-            verbose,
-            load,
-            keys: Mutex::new(None),
-        }
-    }
-
-    /// Run `f` with a client holding the cached pair, reading it first if
-    /// none is cached; an auth failure drops the cached pair.
-    pub fn with_api<T>(
-        &self,
-        f: impl FnOnce(&Alpaca) -> Result<T, CliError>,
-    ) -> Result<T, CliError> {
-        let keys = {
-            // Held across the read, so parallel first calls wait for one
-            // keychain read (and at most one macOS approval) instead of
-            // racing to raise several.
-            let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
-            if keys.is_none() {
-                *keys = Some((self.load)()?);
-            }
-            keys.clone().expect("set above")
-        };
-        // One client per call: its request pacing is per process call, and
-        // the client is not `Sync`.
-        let api = Alpaca::new(self.base_url.clone(), keys, self.verbose)?;
-        let out = f(&api);
-        if matches!(out, Err(CliError::Auth(_))) {
-            *self.keys.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        }
-        out
+    fn client(&self) -> Result<&Alpaca<T>, CliError> {
+        self.client.as_ref().map_err(Clone::clone)
     }
 }
 
-/// Blocking inside `async fn` is deliberate: the stdio server polls each call
-/// on its own blocking thread with no Tokio reactor (pk-cli-mcp's `Toolset`
-/// contract), which is where `reqwest::blocking` belongs.
-impl Source for LiveSource {
+impl<T: Transport> Source for ClientSource<T> {
     async fn account(&self) -> Result<Value, CliError> {
-        self.with_api(|a| a.get(account::PATH, &[]))
+        reads::account(self.client()?).await
     }
 
     async fn positions(&self) -> Result<Vec<Value>, CliError> {
-        self.with_api(positions::fetch)
+        reads::positions(self.client()?).await
     }
 
     async fn activities(&self, types: Option<&str>, since: &str) -> Result<Vec<Value>, CliError> {
-        self.with_api(|a| activities::fetch(a, types, since))
+        reads::activities(self.client()?, types, since).await
     }
 }
+
+#[cfg(feature = "native")]
+pub use live::LiveSource;
+
+#[cfg(feature = "native")]
+mod live {
+    use std::sync::Mutex;
+
+    use pk_cli_core::CliError;
+    use pk_cli_http::BlockingTransport;
+    use pk_cli_secrets::CredentialStore;
+    use serde_json::Value;
+
+    use super::Source;
+    use crate::client::Alpaca;
+    use crate::config::Env;
+    use crate::credential::{self, ApiKeys};
+    use crate::reads;
+
+    /// Reads the key pair: `credential::require` live, a stub in tests.
+    type KeyLoader = Box<dyn Fn() -> Result<ApiKeys, CliError> + Send + Sync>;
+
+    /// The live API for `alp mcp`. The key pair is read once, on the first
+    /// call, and kept for the life of the server; a pair Alpaca rejects is
+    /// dropped so the next call reads it again (after the user fixed it in a
+    /// terminal).
+    pub struct LiveSource {
+        base_url: String,
+        verbose: bool,
+        load: KeyLoader,
+        keys: Mutex<Option<ApiKeys>>,
+    }
+
+    impl LiveSource {
+        /// Reads the pair as every command does ([`credential::require`]:
+        /// environment, then keychain).
+        pub fn new(env: Env, base_url: String, creds: CredentialStore, verbose: bool) -> Self {
+            Self::with_loader(
+                base_url,
+                verbose,
+                Box::new(move || credential::require(&creds, env)),
+            )
+        }
+
+        /// With the pair from `load`, for tests of the caching.
+        pub fn with_loader(base_url: String, verbose: bool, load: KeyLoader) -> Self {
+            Self {
+                base_url,
+                verbose,
+                load,
+                keys: Mutex::new(None),
+            }
+        }
+
+        /// A client holding the cached pair, reading it first if none is
+        /// cached. One client per call: its request pacing is per process
+        /// call, and the client is not `Sync`.
+        pub(crate) fn client(&self) -> Result<Alpaca<BlockingTransport>, CliError> {
+            let keys = {
+                // Held across the read, so parallel first calls wait for one
+                // keychain read (and at most one macOS approval) instead of
+                // racing to raise several.
+                let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
+                if keys.is_none() {
+                    *keys = Some((self.load)()?);
+                }
+                keys.clone().expect("set above")
+            };
+            Alpaca::new(self.base_url.clone(), keys, self.verbose)
+        }
+
+        /// `out`, after dropping the cached pair if Alpaca rejected it.
+        pub(crate) fn forget_rejected<T>(&self, out: Result<T, CliError>) -> Result<T, CliError> {
+            if matches!(out, Err(CliError::Auth(_))) {
+                *self.keys.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+            out
+        }
+    }
+
+    /// The blocking client inside `async fn` is deliberate: the stdio server
+    /// polls each call on its own blocking thread with no Tokio reactor
+    /// (pk-cli-mcp's `Toolset` contract), where the transport's futures
+    /// finish on their first poll.
+    impl Source for LiveSource {
+        async fn account(&self) -> Result<Value, CliError> {
+            let api = self.client()?;
+            self.forget_rejected(reads::account(&api).await)
+        }
+
+        async fn positions(&self) -> Result<Vec<Value>, CliError> {
+            let api = self.client()?;
+            self.forget_rejected(reads::positions(&api).await)
+        }
+
+        async fn activities(
+            &self,
+            types: Option<&str>,
+            since: &str,
+        ) -> Result<Vec<Value>, CliError> {
+            let api = self.client()?;
+            self.forget_rejected(reads::activities(&api, types, since).await)
+        }
+    }
+}
+
+/// Today's date in UTC, where the toolset reads it: the system clock
+/// natively; the Worker's clock in the module, since `SystemTime` panics on
+/// `wasm32-unknown-unknown`.
+pub type Today = fn() -> Civil;
 
 /// The toolset `alp mcp` serves.
 pub struct AlpacaTools<S: Source> {
     source: S,
     env: Env,
+    today: Today,
 }
 
 impl<S: Source> AlpacaTools<S> {
     /// `env` is the environment the source reads (`--env`, `ALP_ENV` or
-    /// config), reported in every portfolio result.
+    /// config), reported in every portfolio result. Today comes from the
+    /// system clock.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(source: S, env: Env) -> Self {
-        Self { source, env }
+        Self::with_today(source, env, dates::today)
+    }
+
+    /// As [`AlpacaTools::new`], with today's date from `today`.
+    pub fn with_today(source: S, env: Env, today: Today) -> Self {
+        Self { source, env, today }
     }
 
     pub fn source(&self) -> &S {
@@ -471,6 +539,7 @@ impl<S: Source> AlpacaTools<S> {
         let (since, until) = window(
             non_empty(args.since.as_deref()),
             non_empty(args.until.as_deref()),
+            (self.today)(),
         )?;
         let types = expand_types(args.types.as_deref().unwrap_or_default())?;
         let symbol = non_empty(args.symbol.as_deref());
@@ -511,7 +580,11 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 /// (the year to date), with errors in the tool's own words. Both ends come
 /// back zero-padded (`2026-1-5` is `2026-01-05`), so the string comparisons
 /// that filter rows are date comparisons.
-fn window(since: Option<&str>, until: Option<&str>) -> Result<(String, String), ToolError> {
+fn window(
+    since: Option<&str>,
+    until: Option<&str>,
+    today: Civil,
+) -> Result<(String, String), ToolError> {
     let parse = |name: &str, v: Option<&str>| {
         v.map(|d| {
             dates::parse_iso(d).map(dates::fmt_iso).map_err(|_| {
@@ -521,7 +594,7 @@ fn window(since: Option<&str>, until: Option<&str>) -> Result<(String, String), 
         .transpose()
     };
     let since = parse("since", since)?;
-    let until = parse("until", until)?.unwrap_or_else(|| dates::fmt_iso(dates::today()));
+    let until = parse("until", until)?.unwrap_or_else(|| dates::fmt_iso(today));
     let since = since.unwrap_or_else(|| format!("{}-01-01", &until[..4]));
     if since > until {
         return Err(ToolError::usage(format!(
@@ -578,19 +651,21 @@ mod tests {
         assert!(e.message().contains("letters and digits"), "{e}");
     }
 
+    const TODAY: Civil = (2026, 8, 15);
+
     #[test]
     fn the_window_defaults_to_the_year_to_date_and_checks_its_order() {
-        let (s, u) = window(None, Some("2025-06-30")).unwrap();
+        let (s, u) = window(None, Some("2025-06-30"), TODAY).unwrap();
         assert_eq!((s.as_str(), u.as_str()), ("2025-01-01", "2025-06-30"));
-        let (s, u) = window(None, None).unwrap();
-        assert_eq!(s, format!("{}-01-01", &u[..4]));
-        let e = window(Some("01/02/2026"), None).unwrap_err();
+        let (s, u) = window(None, None, TODAY).unwrap();
+        assert_eq!((s.as_str(), u.as_str()), ("2026-01-01", "2026-08-15"));
+        let e = window(Some("01/02/2026"), None, TODAY).unwrap_err();
         assert!(
             e.message()
                 .starts_with("since must be a date as YYYY-MM-DD"),
             "{e}"
         );
-        let e = window(Some("2026-02-01"), Some("2026-01-01")).unwrap_err();
+        let e = window(Some("2026-02-01"), Some("2026-01-01"), TODAY).unwrap_err();
         assert!(e.message().contains("is after until"), "{e}");
     }
 
@@ -598,66 +673,77 @@ mod tests {
     /// `"2026-1-5" > "2026-01-31"` as text, though 5 January is earlier.
     #[test]
     fn unpadded_dates_are_padded_before_any_comparison() {
-        let (s, u) = window(Some("2026-1-5"), Some("2026-01-31")).unwrap();
+        let (s, u) = window(Some("2026-1-5"), Some("2026-01-31"), TODAY).unwrap();
         assert_eq!((s.as_str(), u.as_str()), ("2026-01-05", "2026-01-31"));
-        let (s, _) = window(None, Some("2026-3-1")).unwrap();
+        let (s, _) = window(None, Some("2026-3-1"), TODAY).unwrap();
         assert_eq!(s, "2026-01-01");
     }
 
-    fn keys() -> ApiKeys {
-        ApiKeys {
-            key_id: "AKDUMMY000000000001".into(),
-            secret_key: "DUMMYSECRET0001".into(),
-        }
-    }
-
-    /// A source whose loader counts its reads.
-    fn counting() -> (LiveSource, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    #[cfg(feature = "native")]
+    mod live {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let reads = std::sync::Arc::new(AtomicUsize::new(0));
-        let counter = std::sync::Arc::clone(&reads);
-        let source = LiveSource::with_loader(
-            "https://api.alpaca.markets".into(),
-            false,
-            Box::new(move || {
-                counter.fetch_add(1, Ordering::SeqCst);
-                Ok(keys())
-            }),
-        );
-        (source, reads)
-    }
+        use std::sync::Arc;
 
-    #[test]
-    fn the_pair_is_read_once_and_again_only_after_a_rejection() {
-        use std::sync::atomic::Ordering;
-        let (source, reads) = counting();
-        // No request is sent: `f` answers without touching the client.
-        assert_eq!(source.with_api(|_| Ok(1)).unwrap(), 1);
-        assert_eq!(source.with_api(|_| Ok(2)).unwrap(), 2);
-        assert_eq!(reads.load(Ordering::SeqCst), 1, "cached after the first");
+        use pk_cli_core::CliError;
 
-        let rejected: Result<(), CliError> =
-            source.with_api(|_| Err(CliError::Auth("HTTP 401".into())));
-        assert!(rejected.is_err());
-        source.with_api(|_| Ok(())).unwrap();
-        assert_eq!(reads.load(Ordering::SeqCst), 2, "re-read after a 401");
+        use crate::config::Env;
+        use crate::credential::{self, ApiKeys};
+        use crate::mcp::LiveSource;
 
-        let failed: Result<(), CliError> =
-            source.with_api(|_| Err(CliError::Upstream("HTTP 503".into())));
-        assert!(failed.is_err());
-        source.with_api(|_| Ok(())).unwrap();
-        assert_eq!(reads.load(Ordering::SeqCst), 2, "kept after a 503");
-    }
+        fn keys() -> ApiKeys {
+            ApiKeys {
+                key_id: "AKDUMMY000000000001".into(),
+                secret_key: "DUMMYSECRET0001".into(),
+            }
+        }
 
-    #[test]
-    fn a_failed_read_is_the_call_s_error_and_is_tried_again_next_call() {
-        let source = LiveSource::with_loader(
-            "https://api.alpaca.markets".into(),
-            false,
-            Box::new(|| Err(credential::missing(Env::Live))),
-        );
-        let e = source.with_api(|_| Ok(())).unwrap_err();
-        assert_eq!(e.exit_code(), 3);
-        assert!(source.with_api(|_| Ok(())).is_err());
+        /// A source whose loader counts its reads.
+        fn counting() -> (LiveSource, Arc<AtomicUsize>) {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&reads);
+            let source = LiveSource::with_loader(
+                "https://api.alpaca.markets".into(),
+                false,
+                Box::new(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(keys())
+                }),
+            );
+            (source, reads)
+        }
+
+        /// No request is sent: building a client reads the pair, and
+        /// `forget_rejected` sees what a request would have answered.
+        #[test]
+        fn the_pair_is_read_once_and_again_only_after_a_rejection() {
+            let (source, reads) = counting();
+            source.client().unwrap();
+            source.client().unwrap();
+            assert_eq!(reads.load(Ordering::SeqCst), 1, "cached after the first");
+
+            let rejected: Result<(), CliError> =
+                source.forget_rejected(Err(CliError::Auth("HTTP 401".into())));
+            assert!(rejected.is_err());
+            source.client().unwrap();
+            assert_eq!(reads.load(Ordering::SeqCst), 2, "re-read after a 401");
+
+            let failed: Result<(), CliError> =
+                source.forget_rejected(Err(CliError::Upstream("HTTP 503".into())));
+            assert!(failed.is_err());
+            source.client().unwrap();
+            assert_eq!(reads.load(Ordering::SeqCst), 2, "kept after a 503");
+        }
+
+        #[test]
+        fn a_failed_read_is_the_call_s_error_and_is_tried_again_next_call() {
+            let source = LiveSource::with_loader(
+                "https://api.alpaca.markets".into(),
+                false,
+                Box::new(|| Err(credential::missing(Env::Live))),
+            );
+            let e = source.client().err().unwrap();
+            assert_eq!(e.exit_code(), 3);
+            assert!(source.client().is_err());
+        }
     }
 }
