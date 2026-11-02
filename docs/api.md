@@ -96,8 +96,6 @@ it pages newest-first and applies the inclusive `[--since, --until]` filter
 client-side, stopping once a page's oldest dated row is two calendar months
 past `--since` (grace for late-processed corrections) or a short page ends
 the history. Cost: a few extra requests when `--until` is far in the past.
-(The Worker module's walk, capped at 40 pages, is the one exception: it
-sends an `until` padded by two to three months; see §6.)
 A future optimization could use the `date=YYYY-MM-DD` single-day mode
 (unlimited page size) for one-day pulls.
 
@@ -141,19 +139,18 @@ error). The tools read:
 | Tool | Requests |
 |---|---|
 | `alpaca_portfolio` | `GET /v2/account`, then `GET /v2/positions` |
-| `alpaca_activities` | `GET /v2/account/activities?direction=desc&page_size=100[&activity_types=<comma list>]&until=<YYYY-MM-01T00:00:00Z>[&page_token=<last id>]`, page after page until a page has fewer than 100 rows or its oldest dated row is two calendar months before `since`, at most 40 pages |
+| `alpaca_activities` | `GET /v2/account/activities?direction=desc&page_size=100[&activity_types=<comma list>][&page_token=<last id>]`, page after page until a page has fewer than 100 rows or its oldest dated row is two calendar months before `since` |
 
 One call reads at most 40 activity pages (`MAX_ACTIVITY_PAGES`, 4,000
 rows): Cloudflare's free plan allows 50 outbound requests per invocation,
-and past that every `fetch` fails. So that an old window's pages are not
-spent on everything since, the module's walk adds a server-side `until`:
-midnight UTC on the first day of the third month after the window's end.
-That pads the creation-time, exclusive bound (§3's trap) by at least the two
-calendar months the far end's stop rule allows; the inclusive filter still
-runs on the rows. A window whose walk needs more than 40 pages is a `usage`
-error asking for shorter windows or a `types` filter; it never answers with
-part of the history. The binary's walk has neither the bound nor the
-server-side `until`.
+and past that every `fetch` fails. The walk is otherwise the binary's: it
+starts at the newest row and sends no server-side date bound (§3's trap),
+so every row since `since` counts against the 40 pages, including those
+after `until`. A walk that needs more is a `usage` error saying so, which
+suggests a later `since`, a `types` filter or `alp transactions list`; it
+never answers with part of the history. An old window on a very active
+account can therefore be out of the module's reach. The binary's walk has
+no bound.
 
 Its settings are the Worker's secrets and vars, by the CLI's own names:
 `ALP_API_KEY_ID` and `ALP_API_SECRET_KEY` (both, or the call is an auth

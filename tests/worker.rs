@@ -232,14 +232,6 @@ fn activities_page_by_token_and_filter_by_the_window() {
         param(&seen[1], "page_token"),
         pk_cli_core::transport::percent_encode(&last_id)
     );
-    // The walk starts a few months past the window's end; this window ends
-    // today, so that is in the future and costs nothing.
-    for params in &seen {
-        assert!(
-            param(params, "until").ends_with("-01T00%3A00%3A00Z"),
-            "{params:?}"
-        );
-    }
 }
 
 /// One call reads at most `MAX_ACTIVITY_PAGES` pages, inside Cloudflare's
@@ -268,16 +260,21 @@ fn a_walk_past_the_page_budget_is_a_usage_error_after_exactly_the_budget() {
     assert_eq!(sent, alp::worker::MAX_ACTIVITY_PAGES);
     assert!(sent < 50, "inside Cloudflare's free-plan cap");
     assert!(t.starts_with("usage: "), "{t}");
-    assert!(t.contains("from 2020-01-01 to "), "{t}");
-    assert!(t.contains("split the window into shorter ones"), "{t}");
+    assert!(t.contains("from today back to 2020-01-01"), "{t}");
+    assert!(t.contains("rows after `until` count too"), "{t}");
+    assert!(
+        t.contains("`alp transactions list` has no such limit"),
+        "{t}"
+    );
 }
 
-/// An old window on a busy account: the walk starts at a server-side
-/// `until` a few months past the window instead of at today, so years of
-/// newer rows do not use up the budget before the window is reached.
+/// An old window on a busy account fails loudly rather than reading less:
+/// the walk sends no server-side date bound (it bounds creation time, and
+/// would drop a late correction dated in the window), so years of newer rows
+/// can use up the budget before the window is reached.
 #[test]
-fn an_old_window_is_walked_from_its_end_not_from_today() {
-    let mut untils = Vec::new();
+fn an_old_window_past_the_budget_is_refused_not_cut_short() {
+    let mut sent = 0;
     let out = call(
         tools,
         json!({"name": "alpaca_activities", "arguments": {"since": "2024-01-01", "until": "2024-12-31"}}),
@@ -287,39 +284,23 @@ fn an_old_window_is_walked_from_its_end_not_from_today() {
                 unreachable!()
             };
             let (_, params) = checked(&req, "https://api.alpaca.markets");
-            let until = params
-                .iter()
-                .find(|(k, _)| k == "until")
-                .map(|(_, v)| v.clone());
-            untils.push(until.clone());
-            match until.as_deref() {
-                // Alpaca, honouring `until`: the window's rows and a late
-                // correction created in January, then the end of history.
-                Some("2025-03-01T00%3A00%3A00Z") => ok(json!([
-                    {"id": "c", "activity_type": "DIV", "date": "2025-01-15", "net_amount": "1.00"},
-                    {"id": "b", "activity_type": "DIV", "date": "2024-12-31", "net_amount": "2.00"},
-                    {"id": "a", "activity_type": "DIV", "date": "2024-01-01", "net_amount": "3.00"},
-                ])
-                .to_string()),
-                // From today, page after page of newer rows.
-                _ => ok(Value::Array(
-                    (0..100)
-                        .map(|i| json!({"id": format!("new-{i}"), "activity_type": "INT", "date": "2026-03-01"}))
-                        .collect(),
-                )
-                .to_string()),
+            for bound in ["until", "after", "date"] {
+                assert!(params.iter().all(|(k, _)| k != bound), "{params:?}");
             }
+            sent += 1;
+            ok(Value::Array(
+                (0..100)
+                    .map(|i| json!({"id": format!("{sent}-{i}"), "activity_type": "INT", "date": "2026-03-01"}))
+                    .collect(),
+            )
+            .to_string())
         },
     );
-    assert_eq!(out["result"]["isError"], false, "{out}");
-    assert_eq!(untils, [Some("2025-03-01T00%3A00%3A00Z".to_string())]);
-    let dates: Vec<&str> = out["result"]["structuredContent"]["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|i| i["date"].as_str().unwrap())
-        .collect();
-    assert_eq!(dates, ["2024-12-31", "2024-01-01"]);
+    let t = text(&out);
+    assert_eq!(sent, alp::worker::MAX_ACTIVITY_PAGES);
+    assert!(t.starts_with("usage: "), "{t}");
+    assert!(t.contains("from today back to 2024-01-01"), "{t}");
+    assert!(out["result"].get("structuredContent").is_none(), "{out}");
 }
 
 #[test]
