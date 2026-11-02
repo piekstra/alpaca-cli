@@ -53,36 +53,53 @@ pub trait Source {
     async fn activities(&self, types: Option<&str>, since: &str) -> Result<Vec<Value>, CliError>;
 }
 
+/// Reads the key pair: `credential::require` live, a stub in tests.
+type KeyLoader = Box<dyn Fn() -> Result<ApiKeys, CliError> + Send + Sync>;
+
 /// The live API. The key pair is read once, on the first call, and kept for
 /// the life of the server; a pair Alpaca rejects is dropped so the next call
 /// reads it again (after the user fixed it in a terminal).
 pub struct LiveSource {
-    env: Env,
     base_url: String,
-    creds: CredentialStore,
     verbose: bool,
+    load: KeyLoader,
     keys: Mutex<Option<ApiKeys>>,
 }
 
 impl LiveSource {
+    /// Reads the pair as every command does ([`credential::require`]:
+    /// environment, then keychain).
     pub fn new(env: Env, base_url: String, creds: CredentialStore, verbose: bool) -> Self {
-        Self {
-            env,
+        Self::with_loader(
             base_url,
-            creds,
             verbose,
+            Box::new(move || credential::require(&creds, env)),
+        )
+    }
+
+    /// With the pair from `load`, for tests of the caching.
+    pub fn with_loader(base_url: String, verbose: bool, load: KeyLoader) -> Self {
+        Self {
+            base_url,
+            verbose,
+            load,
             keys: Mutex::new(None),
         }
     }
 
-    fn with_api<T>(&self, f: impl FnOnce(&Alpaca) -> Result<T, CliError>) -> Result<T, CliError> {
+    /// Run `f` with a client holding the cached pair, reading it first if
+    /// none is cached; an auth failure drops the cached pair.
+    pub fn with_api<T>(
+        &self,
+        f: impl FnOnce(&Alpaca) -> Result<T, CliError>,
+    ) -> Result<T, CliError> {
         let keys = {
             // Held across the read, so parallel first calls wait for one
             // keychain read (and at most one macOS approval) instead of
             // racing to raise several.
             let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
             if keys.is_none() {
-                *keys = Some(credential::require(&self.creds, self.env)?);
+                *keys = Some((self.load)()?);
             }
             keys.clone().expect("set above")
         };
@@ -425,12 +442,21 @@ impl<S: Source> AlpacaTools<S> {
         let page = PageRequest::new(&args.list, &PortfolioFilter { symbol })?;
         let detailed = args.list.format().is_detailed();
         let account = self.source.account().await?;
-        let matched: Vec<PositionItem> = self
-            .source
-            .positions()
-            .await?
-            .iter()
-            .filter_map(Position::from_json)
+        let rows = self.source.positions().await?;
+        let positions: Vec<Position> = rows.iter().filter_map(Position::from_json).collect();
+        // `alp positions list` warns and goes on; a model has no stderr, so a
+        // row that cannot be read fails the call rather than quietly
+        // shortening the portfolio.
+        if positions.len() < rows.len() {
+            return Err(ToolError::upstream(format!(
+                "{} of {} position rows from Alpaca lack a symbol or quantity, so the \
+                 portfolio would be incomplete; the response shape has changed (docs/api.md)",
+                rows.len() - positions.len(),
+                rows.len()
+            )));
+        }
+        let matched: Vec<PositionItem> = positions
+            .into_iter()
             .filter(|p| symbol.is_none_or(|s| p.symbol.eq_ignore_ascii_case(s)))
             .map(|p| PositionItem::from(p, detailed))
             .collect();
@@ -482,20 +508,21 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 }
 
 /// The inclusive window, defaulted as `alp transactions list` defaults it
-/// (the year to date), with errors in the tool's own words.
+/// (the year to date), with errors in the tool's own words. Both ends come
+/// back zero-padded (`2026-1-5` is `2026-01-05`), so the string comparisons
+/// that filter rows are date comparisons.
 fn window(since: Option<&str>, until: Option<&str>) -> Result<(String, String), ToolError> {
     let parse = |name: &str, v: Option<&str>| {
         v.map(|d| {
-            dates::parse_iso(d).map_err(|_| {
+            dates::parse_iso(d).map(dates::fmt_iso).map_err(|_| {
                 ToolError::usage(format!("{name} must be a date as YYYY-MM-DD, got `{d}`"))
             })
         })
         .transpose()
     };
-    parse("since", since)?;
-    parse("until", until)?;
-    let until = until.map_or_else(|| dates::fmt_iso(dates::today()), String::from);
-    let since = since.map_or_else(|| format!("{}-01-01", &until[..4]), String::from);
+    let since = parse("since", since)?;
+    let until = parse("until", until)?.unwrap_or_else(|| dates::fmt_iso(dates::today()));
+    let since = since.unwrap_or_else(|| format!("{}-01-01", &until[..4]));
     if since > until {
         return Err(ToolError::usage(format!(
             "since ({since}) is after until ({until})"
@@ -565,5 +592,72 @@ mod tests {
         );
         let e = window(Some("2026-02-01"), Some("2026-01-01")).unwrap_err();
         assert!(e.message().contains("is after until"), "{e}");
+    }
+
+    /// An unpadded date compares as a string, so it is padded first:
+    /// `"2026-1-5" > "2026-01-31"` as text, though 5 January is earlier.
+    #[test]
+    fn unpadded_dates_are_padded_before_any_comparison() {
+        let (s, u) = window(Some("2026-1-5"), Some("2026-01-31")).unwrap();
+        assert_eq!((s.as_str(), u.as_str()), ("2026-01-05", "2026-01-31"));
+        let (s, _) = window(None, Some("2026-3-1")).unwrap();
+        assert_eq!(s, "2026-01-01");
+    }
+
+    fn keys() -> ApiKeys {
+        ApiKeys {
+            key_id: "AKDUMMY000000000001".into(),
+            secret_key: "DUMMYSECRET0001".into(),
+        }
+    }
+
+    /// A source whose loader counts its reads.
+    fn counting() -> (LiveSource, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&reads);
+        let source = LiveSource::with_loader(
+            "https://api.alpaca.markets".into(),
+            false,
+            Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(keys())
+            }),
+        );
+        (source, reads)
+    }
+
+    #[test]
+    fn the_pair_is_read_once_and_again_only_after_a_rejection() {
+        use std::sync::atomic::Ordering;
+        let (source, reads) = counting();
+        // No request is sent: `f` answers without touching the client.
+        assert_eq!(source.with_api(|_| Ok(1)).unwrap(), 1);
+        assert_eq!(source.with_api(|_| Ok(2)).unwrap(), 2);
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "cached after the first");
+
+        let rejected: Result<(), CliError> =
+            source.with_api(|_| Err(CliError::Auth("HTTP 401".into())));
+        assert!(rejected.is_err());
+        source.with_api(|_| Ok(())).unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "re-read after a 401");
+
+        let failed: Result<(), CliError> =
+            source.with_api(|_| Err(CliError::Upstream("HTTP 503".into())));
+        assert!(failed.is_err());
+        source.with_api(|_| Ok(())).unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "kept after a 503");
+    }
+
+    #[test]
+    fn a_failed_read_is_the_call_s_error_and_is_tried_again_next_call() {
+        let source = LiveSource::with_loader(
+            "https://api.alpaca.markets".into(),
+            false,
+            Box::new(|| Err(credential::missing(Env::Live))),
+        );
+        let e = source.with_api(|_| Ok(())).unwrap_err();
+        assert_eq!(e.exit_code(), 3);
+        assert!(source.with_api(|_| Ok(())).is_err());
     }
 }

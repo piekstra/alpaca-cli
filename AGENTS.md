@@ -107,5 +107,7 @@ and drive the installed binary: `alp info`, `alp auth status`,
 `alp account --json`, `alp positions --json`, `alp transactions list --json`,
 the error paths. For the MCP tools, drive the installed `alp mcp` over stdio
 with JSON-RPC lines (`initialize`, `tools/list`, `tools/call`);
-`alp mcp --list-tools` prints the definitions without a credential. The owner runs `alp auth login` themselves — never ask for
-key material, and never echo it.
+`alp mcp --list-tools` prints the definitions without a credential.
+
+The owner runs `alp auth login` themselves — never ask for key material, and
+never echo it.

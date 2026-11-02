@@ -165,12 +165,21 @@ pub fn resolve(
     creds: &CredentialStore,
     env: Env,
 ) -> Result<Option<(ApiKeys, KeySource)>, CliError> {
-    if let Some(keys) = from_env()? {
-        return Ok(Some((keys, KeySource::Env)));
-    }
-    Ok(read(creds, env)?.map(|k| (k, KeySource::Keychain)))
+    resolve_with(from_env(), || read(creds, env))
 }
 
+/// [`resolve`]'s precedence over its two sources: the environment's answer,
+/// and a keychain read that runs only when the environment holds no pair. An
+/// environment error (half a pair) stops there, never falling back.
+fn resolve_with(
+    from_env: Result<Option<ApiKeys>, CliError>,
+    keychain: impl FnOnce() -> Result<Option<ApiKeys>, CliError>,
+) -> Result<Option<(ApiKeys, KeySource)>, CliError> {
+    if let Some(keys) = from_env? {
+        return Ok(Some((keys, KeySource::Env)));
+    }
+    Ok(keychain()?.map(|k| (k, KeySource::Keychain)))
+}
 /// The pair from [`ENV_KEY_ID`] + [`ENV_SECRET_KEY`], or `None` when neither
 /// is set. One without the other, or either empty, is an auth error naming
 /// the problem: falling back to the keychain would send a key the caller did
@@ -320,6 +329,45 @@ mod tests {
         let e = from_vars(some("AKDUMMY000000000001"), some("  ")).unwrap_err();
         assert_eq!(e.exit_code(), 3);
         assert!(e.to_string().contains("empty"), "{e}");
+    }
+
+    fn pair(id: &str) -> ApiKeys {
+        ApiKeys {
+            key_id: id.into(),
+            secret_key: "DUMMYSECRET0001".into(),
+        }
+    }
+
+    #[test]
+    fn the_environment_wins_and_the_keychain_is_then_never_read() {
+        let got = resolve_with(Ok(Some(pair("AKDUMMYENV00000001"))), || {
+            panic!("the keychain must not be read when the environment holds a pair")
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(got.0.key_id, "AKDUMMYENV00000001");
+        assert_eq!(got.1, KeySource::Env);
+    }
+
+    #[test]
+    fn the_keychain_answers_only_when_the_environment_is_empty() {
+        let got = resolve_with(Ok(None), || Ok(Some(pair("AKDUMMYKEYCHAIN0001"))))
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.0.key_id, "AKDUMMYKEYCHAIN0001");
+        assert_eq!(got.1, KeySource::Keychain);
+        assert!(resolve_with(Ok(None), || Ok(None)).unwrap().is_none());
+    }
+
+    #[test]
+    fn half_a_pair_in_the_environment_never_falls_back_to_the_keychain() {
+        let half = from_vars(some("AKDUMMY000000000001"), None);
+        let e = resolve_with(half, || {
+            panic!("half a pair must not fall back to the keychain")
+        })
+        .unwrap_err();
+        assert_eq!(e.exit_code(), 3);
+        assert!(e.to_string().contains(ENV_SECRET_KEY), "{e}");
     }
 
     #[test]

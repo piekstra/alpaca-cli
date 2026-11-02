@@ -105,31 +105,34 @@ pub fn status(
     creds: &CredentialStore,
     verify: bool,
 ) -> Result<(), CliError> {
-    let stored = credential::read(creds, env)?;
-    let in_keychain = stored.is_some();
     // The environment wins over the keychain for every request (DESIGN.md
-    // §1.7), so status reports the pair requests will actually send.
-    let (stored, note) = match credential::from_env() {
-        Ok(Some(keys)) => (
-            Some(keys),
-            Some(format!(
-                "using the key pair from {} and {}; requests do not read the keychain",
-                credential::ENV_KEY_ID,
-                credential::ENV_SECRET_KEY
-            )),
-        ),
-        Ok(None) => (stored, None),
-        Err(e) => (None, Some(e.to_string())),
+    // §1.7), so status reports the pair requests will actually send, and
+    // fails as they do (exit 3) on half a pair. With a pair in the
+    // environment the keychain is not opened, so `credential_in_keychain` is
+    // left out rather than guessed.
+    let (stored, in_keychain) = match credential::from_env()? {
+        Some(keys) => {
+            if !common.quiet {
+                eprintln!(
+                    "using the key pair from {} and {}; requests do not read the keychain",
+                    credential::ENV_KEY_ID,
+                    credential::ENV_SECRET_KEY
+                );
+            }
+            (Some(keys), None)
+        }
+        None => {
+            let stored = credential::read(creds, env)?;
+            let in_keychain = stored.is_some();
+            (stored, Some(in_keychain))
+        }
     };
-    if let (Some(note), false) = (&note, common.quiet) {
-        eprintln!("{note}");
-    }
     // The credential is an API key pair; `password` is the nearest variant the
     // family's AuthMethod enum offers (like schw's OAuth). `info.auth.method`
     // is the free string and says `api-key`.
     let mut st = AuthStatus::new(true, stored.is_some(), AuthMethod::Password);
     st.username = stored.as_ref().map(ApiKeys::masked_key_id);
-    st.credential_in_keychain = Some(in_keychain);
+    st.credential_in_keychain = in_keychain;
 
     if verify {
         match stored {

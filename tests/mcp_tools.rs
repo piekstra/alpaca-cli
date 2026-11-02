@@ -190,6 +190,21 @@ fn the_environment_is_the_one_the_server_reads() {
     assert!(out.get("next_cursor").is_none());
 }
 
+/// `alp positions list` warns on stderr and goes on; a model sees no
+/// stderr, so a row it cannot read fails the call instead of quietly
+/// shortening the portfolio.
+#[test]
+fn a_position_row_without_a_symbol_fails_the_call_rather_than_vanishing() {
+    let mut fixtures = Fixtures::new();
+    fixtures
+        .positions
+        .push(json!({"qty": "1", "market_value": "1.00"}));
+    let t = AlpacaTools::new(fixtures, Env::Live);
+    let text = err(&call(&t, PORTFOLIO_TOOL, json!({}))).to_string();
+    assert!(text.starts_with("upstream:"), "{text}");
+    assert!(text.contains("1 of 3 position rows"), "{text}");
+}
+
 // ---- alpaca_activities ------------------------------------------------------
 
 #[test]
