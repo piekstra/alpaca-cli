@@ -14,6 +14,11 @@ one entry per environment (`live`, `paper`). Keys enter via an interactive
 no-echo prompt, `--stdin`, or `--from-env <VAR>` — never argv, never a file,
 never a log. `--verbose` prints request paths and parameters, never headers.
 
+A host with its own secure store (the Claude Desktop extension) passes the
+pair instead as `ALP_API_KEY_ID` and `ALP_API_SECRET_KEY`. With both set the
+keychain is never opened; with only one set, or either empty, the command
+fails (exit 3) rather than fall back to a different pair.
+
 An Alpaca API key pair is a **full-power credential**: the same pair that
 reads a position can place a live order or liquidate one. Treat it like a
 password, and prefer creating it with trading disabled on the Alpaca
@@ -30,6 +35,10 @@ dashboard if the account offers that.
   HTTPS `base_url` override). `alp api` refuses absolute URLs off that
   origin — including lookalike hostnames — before the keychain is read.
   No telemetry, no third-party services.
+- `alp mcp` serves two read-only tools over the same client. A tool call
+  never signs in, prompts or creates a keychain item: a missing or rejected
+  pair is an `auth` error asking the user to run `alp auth login` in a
+  terminal.
 - It hardcodes no secrets. `gitleaks` runs in CI over the full history, and
   an offline test walks `git ls-files` for personal-data shapes.
 

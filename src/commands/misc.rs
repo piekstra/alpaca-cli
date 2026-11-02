@@ -18,7 +18,14 @@ pub fn info(json_mode: bool) -> Result<(), CliError> {
             method: "api-key".into(),
             login_hint: Some(format!("{BIN} auth login")),
         },
-        &["account", "positions", "transactions", "dividends", "api"],
+        &[
+            "account",
+            "positions",
+            "transactions",
+            "dividends",
+            "api",
+            "mcp",
+        ],
     );
     let v = serde_json::to_value(&info).unwrap_or_default();
     if json_mode {

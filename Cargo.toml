@@ -1,9 +1,10 @@
 [package]
 name = "alpaca-cli"
 description = "Read-only CLI for Alpaca brokerage accounts (piekstra-cli/1), over the official Trading API."
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-rust-version = "1.75"
+# pk-cli-mcp (rmcp 3.8, the `stdio` feature) needs 1.88.
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/piekstra/alpaca-cli"
 homepage = "https://github.com/piekstra/alpaca-cli"
@@ -19,12 +20,15 @@ name = "alp"
 path = "src/main.rs"
 
 [dependencies]
-pk-cli-core = { git = "https://github.com/piekstra/cli-common", tag = "v0.7.0", features = ["reqwest"] }
-pk-cli-secrets = { git = "https://github.com/piekstra/cli-common", tag = "v0.7.0" }
-pk-cli-config = { git = "https://github.com/piekstra/cli-common", tag = "v0.7.0" }
-pk-cli-selfupdate = { git = "https://github.com/piekstra/cli-common", tag = "v0.7.0" }
-pk-cli-auth = { git = "https://github.com/piekstra/cli-common", tag = "v0.7.0" }
-pk-cli-http = { git = "https://github.com/piekstra/cli-common", tag = "v0.7.0" }
+pk-cli-core = { git = "https://github.com/piekstra/cli-common", tag = "v0.12.0", features = ["reqwest"] }
+pk-cli-secrets = { git = "https://github.com/piekstra/cli-common", tag = "v0.12.0" }
+pk-cli-config = { git = "https://github.com/piekstra/cli-common", tag = "v0.12.0" }
+pk-cli-selfupdate = { git = "https://github.com/piekstra/cli-common", tag = "v0.12.0" }
+pk-cli-auth = { git = "https://github.com/piekstra/cli-common", tag = "v0.12.0" }
+pk-cli-http = { git = "https://github.com/piekstra/cli-common", tag = "v0.12.0" }
+# `alp mcp`: the MCP profile's tools over the same commands (DESIGN.md §1.9).
+pk-cli-mcp = { git = "https://github.com/piekstra/cli-common", tag = "v0.12.0", features = ["stdio"] }
+schemars = "1"
 
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
@@ -36,6 +40,8 @@ serde_json = { version = "1", features = ["preserve_order"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [dev-dependencies]
+# The MCP profile's conformance checks, for the tests only.
+pk-cli-mcp = { git = "https://github.com/piekstra/cli-common", tag = "v0.12.0", features = ["test-util"] }
 assert_cmd = "2"
 predicates = "3"
 

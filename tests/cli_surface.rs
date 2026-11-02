@@ -37,6 +37,7 @@ const GROUPS: &[&str] = &[
     "transactions",
     "dividends",
     "api",
+    "mcp",
     "self-update",
     "completions",
     "info",

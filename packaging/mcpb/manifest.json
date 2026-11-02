@@ -1,0 +1,91 @@
+{
+  "manifest_version": "0.3",
+  "name": "alp",
+  "display_name": "Alpaca (alp)",
+  "version": "0.2.0",
+  "description": "Read-only access to your own Alpaca brokerage balances, positions and activity, through the open-source alp CLI.",
+  "long_description": "Ask Claude about your Alpaca brokerage account: what you hold and what it is worth, and what happened over a period (trade fills, dividends, interest, fees). Two read-only tools, alpaca_portfolio and alpaca_activities; nothing can trade, transfer or change your account. Your Alpaca API key pair stays on your computer: Claude Desktop keeps it in its own secure store and passes it to the bundled alp binary, which calls Alpaca's Trading API directly. Unofficial; not affiliated with Alpaca.",
+  "author": {
+    "name": "piekstra",
+    "url": "https://github.com/piekstra"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/piekstra/alpaca-cli"
+  },
+  "homepage": "https://github.com/piekstra/alpaca-cli",
+  "documentation": "https://github.com/piekstra/alpaca-cli#use-with-claude",
+  "support": "https://github.com/piekstra/alpaca-cli/issues",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["alpaca", "brokerage", "stocks", "finance", "read-only"],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/alp",
+    "mcp_config": {
+      "command": "${__dirname}/server/alp",
+      "args": ["mcp"],
+      "env": {
+        "ALP_API_KEY_ID": "${user_config.api_key_id}",
+        "ALP_API_SECRET_KEY": "${user_config.api_secret_key}",
+        "ALP_ENV": "${user_config.environment}"
+      },
+      "platform_overrides": {
+        "win32": {
+          "command": "${__dirname}/server/alp.exe",
+          "args": ["mcp"],
+          "env": {
+            "ALP_API_KEY_ID": "${user_config.api_key_id}",
+            "ALP_API_SECRET_KEY": "${user_config.api_secret_key}",
+            "ALP_ENV": "${user_config.environment}"
+          }
+        },
+        "linux": {
+          "command": "${__dirname}/server/linux/alp",
+          "args": ["mcp"],
+          "env": {
+            "ALP_API_KEY_ID": "${user_config.api_key_id}",
+            "ALP_API_SECRET_KEY": "${user_config.api_secret_key}",
+            "ALP_ENV": "${user_config.environment}"
+          }
+        }
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "alpaca_portfolio",
+      "description": "Your Alpaca account's balances and open positions."
+    },
+    {
+      "name": "alpaca_activities",
+      "description": "Account activity over a date range: trade fills, dividends, interest and fees."
+    }
+  ],
+  "tools_generated": false,
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"]
+  },
+  "user_config": {
+    "api_key_id": {
+      "type": "string",
+      "title": "Alpaca API key ID",
+      "description": "The key ID from the API Keys panel of your Alpaca dashboard. The pair can trade, so keep it to yourself; the tools here only read.",
+      "sensitive": true,
+      "required": true
+    },
+    "api_secret_key": {
+      "type": "string",
+      "title": "Alpaca API secret key",
+      "description": "The secret key shown once beside the key ID when Alpaca issued the pair.",
+      "sensitive": true,
+      "required": true
+    },
+    "environment": {
+      "type": "string",
+      "title": "Environment",
+      "description": "live (the default) or paper. Live and paper accounts have different key pairs; use the pair issued for this one.",
+      "default": "live",
+      "required": false
+    }
+  }
+}
