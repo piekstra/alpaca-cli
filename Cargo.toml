@@ -3,8 +3,8 @@ name = "alpaca-cli"
 description = "Read-only CLI for Alpaca brokerage accounts (piekstra-cli/1), over the official Trading API."
 version = "0.3.1"
 edition = "2021"
-# pk-cli-mcp (rmcp 3.8, the `stdio` feature) needs 1.88.
-rust-version = "1.88"
+# uuid 1.29.0, which pk-cli-mcp pulls in through rmcp 3.8, needs 1.89.
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/piekstra/alpaca-cli"
 homepage = "https://github.com/piekstra/alpaca-cli"
