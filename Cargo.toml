@@ -1,7 +1,7 @@
 [package]
 name = "alpaca-cli"
 description = "Read-only CLI for Alpaca brokerage accounts (piekstra-cli/1), over the official Trading API."
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 # uuid 1.29.0, which pk-cli-mcp pulls in through rmcp 3.8, needs 1.89.
 rust-version = "1.89"
@@ -44,16 +44,16 @@ native = [
 wasm = ["pk-cli-mcp/wasm"]
 
 [dependencies]
-pk-cli-core = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.1" }
-pk-cli-secrets = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.1", optional = true }
-pk-cli-config = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.1", optional = true }
-pk-cli-selfupdate = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.1", optional = true }
-pk-cli-auth = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.1", optional = true }
+pk-cli-core = { git = "https://github.com/piekstra/cli-common", tag = "v0.27.0" }
+pk-cli-secrets = { git = "https://github.com/piekstra/cli-common", tag = "v0.27.0", optional = true }
+pk-cli-config = { git = "https://github.com/piekstra/cli-common", tag = "v0.27.0", optional = true }
+pk-cli-selfupdate = { git = "https://github.com/piekstra/cli-common", tag = "v0.27.0", optional = true }
+pk-cli-auth = { git = "https://github.com/piekstra/cli-common", tag = "v0.27.0", optional = true }
 # The blocking HTTP client, behind pk-cli-core's `Transport`.
-pk-cli-http = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.1", optional = true }
+pk-cli-http = { git = "https://github.com/piekstra/cli-common", tag = "v0.27.0", optional = true }
 # The MCP profile's tools over the same client (DESIGN.md §1.9): `alp mcp`
 # with `native`, the Worker module with `wasm`.
-pk-cli-mcp = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.1" }
+pk-cli-mcp = { git = "https://github.com/piekstra/cli-common", tag = "v0.27.0" }
 schemars = "1"
 
 clap = { version = "4", features = ["derive", "env"], optional = true }
@@ -67,7 +67,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 [dev-dependencies]
 # The MCP profile's conformance checks and, with `wasm`, the stand-in host,
 # for the tests only.
-pk-cli-mcp = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.1", features = ["test-util"] }
+pk-cli-mcp = { git = "https://github.com/piekstra/cli-common", tag = "v0.27.0", features = ["test-util"] }
 assert_cmd = "2"
 predicates = "3"
 

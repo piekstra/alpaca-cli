@@ -145,7 +145,7 @@ pub fn status(
                     }
                     // Rejected keys are a *status*, not a failure of the
                     // status command.
-                    Err(CliError::Auth(_)) => {
+                    Err(e) if e.is_auth() => {
                         st.session_valid = Some(false);
                         st.authenticated = false;
                     }

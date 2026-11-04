@@ -257,6 +257,55 @@ fn dividends_stands_for_every_dividend_and_interest_type() {
     );
 }
 
+/// A page boundary falls inside a day, and a row posts before the next page. A cursor holds no state
+/// at Alpaca, so a second set of fixtures stands for the later read.
+#[test]
+fn an_activity_that_posts_between_pages_repeats_nothing_and_skips_nothing() {
+    let row = |id: &str, date: &str| {
+        json!({"id": id, "activity_type": "DIV", "date": date, "net_amount": "1.00",
+               "description": "Sample"})
+    };
+    let before = vec![
+        row("d", "2026-03-04"),
+        row("c", "2026-03-03"),
+        row("b", "2026-03-03"),
+        row("a", "2026-03-01"),
+    ];
+    let mut after = vec![row("e", "2026-03-05")];
+    after.extend(before.clone());
+    let args = json!({"since": "2026-01-01", "until": "2026-12-31", "limit": 2,
+                      "response_format": "detailed"});
+    let ids = |page: &Value| -> Vec<String> {
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let with_rows =
+        |rows: Vec<Value>| AlpacaTools::new(Fixtures::new().with_activities(rows), Env::Live);
+
+    let t = with_rows(before);
+    let answer = call(&t, ACTIVITIES_TOOL, args.clone());
+    let first = assert_fits(&t, ACTIVITIES_TOOL, &answer);
+    let mut seen = ids(first);
+    assert_eq!(seen[0], "d");
+    let later = with_rows(after);
+    let mut cursor = first["next_cursor"].clone();
+    while cursor.is_string() {
+        let mut next = args.clone();
+        next["cursor"] = cursor;
+        let answer = call(&later, ACTIVITIES_TOOL, next);
+        let page = assert_fits(&later, ACTIVITIES_TOOL, &answer);
+        seen.extend(ids(page));
+        cursor = page["next_cursor"].clone();
+    }
+    let mut sorted = seen.clone();
+    sorted.sort();
+    assert_eq!(sorted, ["a", "b", "c", "d"], "{seen:?}");
+}
+
 #[test]
 fn activities_narrow_by_type_symbol_and_dates_inclusive() {
     let t = tools();

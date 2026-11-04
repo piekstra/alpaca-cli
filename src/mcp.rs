@@ -21,7 +21,8 @@ use pk_cli_core::dates::{self, Civil};
 use pk_cli_core::transport::Transport;
 use pk_cli_core::CliError;
 use pk_cli_mcp::{
-    parse_args, ListArgs, Page, PageRequest, Server, ToolDef, ToolError, ToolOutput, Toolset,
+    parse_args, ListArgs, Order, Page, PageRequest, PositionKey, PositionRequest, Server, ToolDef,
+    ToolError, ToolOutput, Toolset,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -162,7 +163,7 @@ mod live {
 
         /// `out`, after dropping the cached pair if Alpaca rejected it.
         pub(crate) fn forget_rejected<T>(&self, out: Result<T, CliError>) -> Result<T, CliError> {
-            if matches!(out, Err(CliError::Auth(_))) {
+            if matches!(&out, Err(e) if e.is_auth()) {
                 *self.keys.lock().unwrap_or_else(|e| e.into_inner()) = None;
             }
             out
@@ -552,7 +553,7 @@ impl<S: Source> AlpacaTools<S> {
         )?;
         let types = expand_types(args.types.as_deref().unwrap_or_default())?;
         let symbol = non_empty(args.symbol.as_deref());
-        let page = PageRequest::new(
+        let page = PositionRequest::new(
             &args.list,
             &ActivitiesFilter {
                 since: &since,
@@ -565,18 +566,24 @@ impl<S: Source> AlpacaTools<S> {
 
         let filter = (!types.is_empty()).then(|| types.join(","));
         let rows = self.source.activities(filter.as_deref(), &since).await?;
-        let matched: Vec<ActivityItem> = keep_sorted(rows, &since, &until, None)
+        let matched = keep_sorted(rows, &since, &until, None)
             .iter()
             .filter(|r| {
                 symbol
                     .is_none_or(|s| str_at(r, "symbol").is_some_and(|x| x.eq_ignore_ascii_case(s)))
             })
-            .map(|r| ActivityItem::from(r, detailed))
+            .map(|r| {
+                let key = PositionKey::new(
+                    activity_date(r).unwrap_or_default(),
+                    &str_at(r, "id").unwrap_or_default(),
+                );
+                (key, ActivityItem::from(r, detailed))
+            })
             .collect();
         ToolOutput::new(&ActivitiesOut {
             since,
             until,
-            page: page.page(matched, "since/until, types or symbol")?,
+            page: page.page(matched, Order::Descending, "since/until, types or symbol")?,
         })
     }
 }
