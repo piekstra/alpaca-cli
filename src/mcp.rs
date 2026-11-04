@@ -573,13 +573,17 @@ impl<S: Source> AlpacaTools<S> {
                     .is_none_or(|s| str_at(r, "symbol").is_some_and(|x| x.eq_ignore_ascii_case(s)))
             })
             .map(|r| {
-                let key = PositionKey::new(
-                    activity_date(r).unwrap_or_default(),
-                    &str_at(r, "id").unwrap_or_default(),
-                );
-                (key, ActivityItem::from(r, detailed))
+                // A row with no id could not hold its place in a position cursor.
+                let id = str_at(r, "id").ok_or_else(|| {
+                    ToolError::upstream(
+                        "Alpaca sent an activity with no id, so this list is not reported; its \
+                         answer has changed",
+                    )
+                })?;
+                let key = PositionKey::new(activity_date(r).unwrap_or_default(), &id);
+                Ok((key, ActivityItem::from(r, detailed)))
             })
-            .collect();
+            .collect::<Result<Vec<_>, ToolError>>()?;
         ToolOutput::new(&ActivitiesOut {
             since,
             until,
