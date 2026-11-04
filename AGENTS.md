@@ -18,7 +18,7 @@ docs.alpaca.markets). It exists to feed tax work:
 
 Conforms to `piekstra-cli/1` (see `~/Dev/cli-common/DESIGN.md` and
 `conformance.md`). Shared behavior comes from the `pk-cli-*` crates pinned to
-tag **v0.27.0** — reuse before writing (dates, output, `RangeArgs`, `Paged`,
+tag **v0.29.0** — reuse before writing (dates, output, `RangeArgs`, `Paged`,
 keychain, config, self-update).
 
 ## The verbatim DTO contract (do not "improve" it)

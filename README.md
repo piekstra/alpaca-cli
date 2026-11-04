@@ -155,6 +155,9 @@ feed (4,000 rows), newest first, and rows newer than `until` count toward
 them. A window further back is refused with a suggestion: a later `since`, a
 `types` filter, or `alp transactions list`, which has no such limit.
 
+A row Alpaca sends with no id fails the `alpaca_activities` call as an upstream error rather than
+being skipped, since its place in the list could not be held.
+
 ## Development
 
 ```console

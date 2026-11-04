@@ -257,6 +257,19 @@ fn dividends_stands_for_every_dividend_and_interest_type() {
     );
 }
 
+/// A row with no id could not hold its place in a position cursor, so it fails the call.
+#[test]
+fn an_activity_with_no_id_is_an_upstream_error() {
+    let fixtures = Fixtures::new().with_activities(vec![json!({
+        "activity_type": "DIV", "date": "2026-03-04", "net_amount": "1.00"
+    })]);
+    let t = AlpacaTools::new(fixtures, Env::Live);
+    let args = json!({"since": "2026-01-01", "until": "2026-12-31"});
+    let text = err(&call(&t, ACTIVITIES_TOOL, args)).to_string();
+    assert!(text.starts_with("upstream:"), "{text}");
+    assert!(text.contains("no id"), "{text}");
+}
+
 /// A page boundary falls inside a day, and a row posts before the next page. A cursor holds no state
 /// at Alpaca, so a second set of fixtures stands for the later read.
 #[test]
