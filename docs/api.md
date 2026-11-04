@@ -141,6 +141,9 @@ error). The tools read:
 | `alpaca_portfolio` | `GET /v2/account`, then `GET /v2/positions` |
 | `alpaca_activities` | `GET /v2/account/activities?direction=desc&page_size=100[&activity_types=<comma list>][&page_token=<last id>]`, page after page until a page has fewer than 100 rows or its oldest dated row is two calendar months before `since` |
 
+An activity with no `id` fails `alpaca_activities` as an upstream error rather than being skipped,
+since its place in the list could not be held.
+
 One call reads at most 40 activity pages (`MAX_ACTIVITY_PAGES`, 4,000
 rows): Cloudflare's free plan allows 50 outbound requests per invocation,
 and past that every `fetch` fails. The walk is otherwise the binary's: it

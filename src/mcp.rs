@@ -576,8 +576,8 @@ impl<S: Source> AlpacaTools<S> {
                 // A row with no id could not hold its place in a position cursor.
                 let id = str_at(r, "id").ok_or_else(|| {
                     ToolError::upstream(
-                        "Alpaca sent an activity with no id, so this list is not reported; its \
-                         answer has changed",
+                        "Alpaca sent an activity with no id, so its place in this list cannot \
+                         be held and the list is not reported",
                     )
                 })?;
                 let key = PositionKey::new(activity_date(r).unwrap_or_default(), &id);

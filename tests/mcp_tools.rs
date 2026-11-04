@@ -257,8 +257,6 @@ fn dividends_stands_for_every_dividend_and_interest_type() {
     );
 }
 
-/// A page boundary falls inside a day, and a row posts before the next page. A cursor holds no state
-/// at Alpaca, so a second set of fixtures stands for the later read.
 /// A row with no id could not hold its place in a position cursor, so it fails the call.
 #[test]
 fn an_activity_with_no_id_is_an_upstream_error() {
@@ -272,6 +270,8 @@ fn an_activity_with_no_id_is_an_upstream_error() {
     assert!(text.contains("no id"), "{text}");
 }
 
+/// A page boundary falls inside a day, and a row posts before the next page. A cursor holds no state
+/// at Alpaca, so a second set of fixtures stands for the later read.
 #[test]
 fn an_activity_that_posts_between_pages_repeats_nothing_and_skips_nothing() {
     let row = |id: &str, date: &str| {
