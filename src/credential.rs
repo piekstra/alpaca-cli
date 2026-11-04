@@ -282,8 +282,8 @@ pub fn require(creds: &CredentialStore, env: Env) -> Result<ApiKeys, CliError> {
 #[cfg(feature = "native")]
 pub fn missing(env: Env) -> CliError {
     CliError::Auth(format!(
-        "no Alpaca API keys stored for the `{}` environment — run `alp auth login`, or set \
-         {ENV_KEY_ID} and {ENV_SECRET_KEY}",
+        "no Alpaca API keys stored for the `{}` environment, and {ENV_KEY_ID} and {ENV_SECRET_KEY} \
+         are not set — run `alp auth login`, or set them",
         env.as_str()
     ))
 }
