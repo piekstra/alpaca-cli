@@ -5,7 +5,7 @@ version = "0.3.2"
 edition = "2021"
 # uuid 1.29.0, which pk-cli-mcp pulls in through rmcp 3.8, needs 1.89.
 rust-version = "1.89"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-only"
 repository = "https://github.com/piekstra/alpaca-cli"
 homepage = "https://github.com/piekstra/alpaca-cli"
 authors = ["piekstra"]
